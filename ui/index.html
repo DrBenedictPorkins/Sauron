@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sauron</title>
+  <link rel="stylesheet" href="style.css?v=2" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div class="header-left">
+        <div class="eye-icon">
+          <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+            <ellipse cx="32" cy="32" rx="30" ry="18" fill="none" stroke="#c0392b" stroke-width="2.5"/>
+            <circle cx="32" cy="32" r="10" fill="#c0392b"/>
+            <circle cx="32" cy="32" r="5" fill="#1a0a00"/>
+            <circle cx="35" cy="29" r="1.5" fill="#ff6b3d" opacity="0.8"/>
+          </svg>
+        </div>
+        <div>
+          <h1>Sauron</h1>
+          <p class="subtitle">The Eye that never sleeps</p>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="scan-status" id="scanStatus"></div>
+        <button class="btn btn-secondary" id="btnQuickScan" title="Crawl all directories, git metadata only, no AI">Quick Scan</button>
+        <button class="btn btn-primary" id="btnDeepScan" title="Full scan + AI summaries (costs tokens)">Deep Scan</button>
+        <button class="btn btn-stop" id="btnStopScan" style="display:none" title="Stop current scan">Stop</button>
+      </div>
+    </header>
+
+    <div class="controls">
+      <div class="search-wrap">
+        <input type="text" id="searchInput" placeholder="Search projects..." autocomplete="off" />
+      </div>
+      <div class="filters">
+        <select id="filterType">
+          <option value="">All types</option>
+          <option value="python">Python</option>
+          <option value="nodejs">Node.js</option>
+          <option value="typescript">TypeScript</option>
+          <option value="electron">Electron</option>
+          <option value="react">React</option>
+          <option value="nextjs">Next.js</option>
+          <option value="react-native">React Native</option>
+          <option value="swift">Swift</option>
+        </select>
+        <select id="filterGroup">
+          <option value="">All groups</option>
+        </select>
+        <label class="toggle-label">
+          <input type="checkbox" id="filterUncommitted" />
+          Uncommitted only
+        </label>
+        <label class="toggle-label">
+          <input type="checkbox" id="filterIgnored" />
+          Show ignored
+        </label>
+      </div>
+      <div class="stats" id="statsBar"></div>
+    </div>
+
+    <main id="projectGrid" class="timeline-container"></main>
+
+    <div id="emptyState" class="empty-state" style="display:none">
+      <div class="eye-large">
+        <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+          <ellipse cx="32" cy="32" rx="30" ry="18" fill="none" stroke="#333" stroke-width="2"/>
+          <circle cx="32" cy="32" r="10" fill="#333"/>
+          <circle cx="32" cy="32" r="5" fill="#111"/>
+        </svg>
+      </div>
+      <p>No projects found. Run a scan to begin.</p>
+    </div>
+  </div>
+
+  <div id="modal" class="modal" style="display:none">
+    <div class="modal-backdrop" id="modalBackdrop"></div>
+    <div class="modal-content" id="modalContent"></div>
+  </div>
+
+  <div id="chatPanel" class="chat-panel" style="display:none">
+    <div class="chat-header">
+      <div class="chat-title" id="chatTitle">AI Chat</div>
+      <div class="chat-actions">
+        <button class="btn-chat-action" id="btnChatCondense" title="Keep only recent messages">Condense</button>
+        <button class="btn-chat-action" id="btnChatClear" title="Clear conversation">Clear</button>
+        <button class="btn-chat-close" id="btnChatClose">&times;</button>
+      </div>
+    </div>
+    <div class="chat-messages" id="chatMessages"></div>
+    <div class="chat-tool-activity" id="chatToolActivity" style="display:none"></div>
+    <div class="chat-input-wrap">
+      <input type="text" id="chatInput" placeholder="Ask about this project..." autocomplete="off" />
+      <button class="btn btn-primary btn-chat-send" id="btnChatSend">Send</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

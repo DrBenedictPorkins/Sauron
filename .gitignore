@@ -1,0 +1,5 @@
+node_modules/
+sauron.db
+sauron.db-shm
+sauron.db-wal
+.env

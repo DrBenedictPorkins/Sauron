@@ -1,0 +1,9 @@
+{
+  "ignore": [],
+  "activeCutoffDays": 30,
+  "quickScanTopN": 20,
+  "maxSummariesPerScan": 50,
+  "scheduleCron": "0 18 * * *",
+  "scheduleEnabled": false,
+  "port": 7777
+}
