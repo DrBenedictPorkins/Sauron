@@ -41,7 +41,7 @@ Run it:
 npm start
 ```
 
-Open `http://localhost:7777`. Click **Quick Scan** to discover projects, then **Deep Scan** to generate AI summaries.
+Open `http://127.0.0.1:7777` (or whatever `HOST:PORT` you set). Click **Quick Scan** to discover projects and gather metadata, then **Deep Scan** to regenerate all AI summaries.
 
 ---
 
@@ -92,25 +92,22 @@ Chat sessions persist per project. **Condense** compresses the conversation hist
 
 ### Configuration
 
-**`.env`** (secrets and environment):
+All configuration lives in `.env`. Copy `.env.example` to get started.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `ANTHROPIC_API_KEY` | Claude API key (required) | -- |
 | `SCAN_ROOTS` | Comma-separated `path:label` pairs | -- |
 | `CLAUDE_MODEL` | Model alias for all AI calls | `claude-haiku-4-5` |
-
-**`config.json`** (runtime settings):
-
-| Key | Description | Default |
-|-----|-------------|---------|
-| `activeCutoffDays` | Quick scan window for "active" projects | `30` |
-| `quickScanTopN` | Max projects in a quick scan | `20` |
-| `maxSummariesPerScan` | Max AI summaries per deep scan (prioritizes recent projects) | `50` |
-| `scheduleCron` | Cron expression for scheduled scans | `0 18 * * *` |
-| `scheduleEnabled` | Enable/disable scheduled scanning | `false` |
-| `port` | Server port | `7777` |
-| `ignore` | Array of directory paths to skip | `[]` |
+| `HOST` | Server bind address | `127.0.0.1` |
+| `PORT` | Server port | `7777` |
+| `ACTIVE_CUTOFF_DAYS` | How far back to look for "active" projects | `30` |
+| `QUICK_SCAN_TOP_N` | Max projects in a targeted quick scan | `20` |
+| `MAX_SUMMARIES_PER_SCAN` | Max AI summaries per deep scan (recent projects first) | `50` |
+| `IGNORE_PATHS` | Comma-separated directory paths to skip | -- |
+| `SCHEDULE_ENABLED` | Enable automatic scanning | `false` |
+| `SCHEDULE_QUICK_CRON` | Cron for automatic quick scans (metadata only) | `*/30 * * * *` (every 30 min) |
+| `SCHEDULE_DEEP_CRON` | Cron for automatic deep scans (metadata + AI summaries) | `0 18 * * *` (6pm daily) |
 
 ### Cost
 

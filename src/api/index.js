@@ -3,7 +3,6 @@ const path = require('path');
 const db = require('../db');
 const config = require('../config');
 const { runScan, isScanInProgress, getProgress, requestStop } = require('../scanner/orchestrator');
-const { validateRoots } = require('../scanner');
 const { chat, clearSession, condenseSession } = require('../chat');
 
 function createApp() {
@@ -106,16 +105,9 @@ function createApp() {
     });
   });
 
-  // Config
+  // Config (read-only — all config lives in .env)
   app.get('/api/config', (_req, res) => {
     res.json(config.load());
-  });
-
-  app.put('/api/config', (req, res) => {
-    const updated = { ...config.load(), ...req.body };
-    const warnings = validateRoots(updated.scanRoots || []);
-    config.save(updated);
-    res.json({ ok: true, warnings });
   });
 
   return app;

@@ -1,7 +1,10 @@
-const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
-const CONFIG_PATH = path.join(__dirname, '../config.json');
+function expandHome(p) {
+  if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
 
 function parseScanRoots() {
   const raw = process.env.SCAN_ROOTS;
@@ -12,17 +15,20 @@ function parseScanRoots() {
   });
 }
 
+function parseIgnore() {
+  const raw = process.env.IGNORE_PATHS;
+  if (!raw) return [];
+  return raw.split(',').map(p => expandHome(p.trim())).filter(Boolean);
+}
+
 function load() {
-  const file = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-  // Scan roots come from .env, everything else from config.json
-  file.scanRoots = parseScanRoots();
-  return file;
+  return {
+    scanRoots: parseScanRoots(),
+    ignore: parseIgnore(),
+    activeCutoffDays: parseInt(process.env.ACTIVE_CUTOFF_DAYS || '30'),
+    quickScanTopN: parseInt(process.env.QUICK_SCAN_TOP_N || '20'),
+    maxSummariesPerScan: parseInt(process.env.MAX_SUMMARIES_PER_SCAN || '50'),
+  };
 }
 
-function save(config) {
-  // Don't persist scanRoots back — they live in .env
-  const { scanRoots, ...rest } = config;
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(rest, null, 2));
-}
-
-module.exports = { load, save, CONFIG_PATH };
+module.exports = { load, expandHome };

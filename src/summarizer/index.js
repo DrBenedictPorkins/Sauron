@@ -32,9 +32,11 @@ ${claudeMd ? `CLAUDE.md:\n${claudeMd}\n` : ''}
 Recent commits:
 ${commits}
 
-Write a concise project summary in 2-3 sentences. Then on a new line starting with "STATUS:", write one of: Active, Stale, Abandoned, Early Stage — and a brief reason (one sentence).
+Write a concise project summary in 2-3 sentences. Do NOT use headings, titles, or labels like "Project Summary:". Just write the summary directly as plain text.
 
-Keep the whole response under 120 words. Be specific about what the project does, not generic.`;
+Then on a new line starting with "STATUS:", write one of: Active, Stale, Abandoned, Early Stage — and a brief reason (one sentence).
+
+Keep the whole response under 120 words. Be specific about what the project does, not generic. No markdown headings.`;
 }
 
 async function summarize(project, transient) {

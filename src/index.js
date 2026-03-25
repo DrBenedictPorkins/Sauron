@@ -5,23 +5,37 @@ const { runScan } = require('./scanner/orchestrator');
 const config = require('./config');
 
 async function main() {
-  const cfg = config.load();
-  const port = cfg.port || 7777;
+  const port = process.env.PORT || 7777;
+  const host = process.env.HOST || '127.0.0.1';
 
   const app = createApp();
-  app.listen(port, () => {
-    console.log(`Sauron is watching at http://localhost:${port}`);
+  app.listen(port, host, () => {
+    console.log(`Sauron is watching at http://${host}:${port}`);
   });
 
-  if (cfg.scheduleEnabled && cfg.scheduleCron) {
-    if (cron.validate(cfg.scheduleCron)) {
-      cron.schedule(cfg.scheduleCron, () => {
+  const scheduleEnabled = process.env.SCHEDULE_ENABLED === 'true';
+  if (scheduleEnabled) {
+    const quickCron = process.env.SCHEDULE_QUICK_CRON;
+    const deepCron = process.env.SCHEDULE_DEEP_CRON;
+
+    if (quickCron && cron.validate(quickCron)) {
+      cron.schedule(quickCron, () => {
+        console.log('[scheduler] Running scheduled quick scan...');
+        runScan(config.load(), 'quick').catch(console.error);
+      });
+      console.log(`[scheduler] Quick scan: ${quickCron}`);
+    }
+
+    if (deepCron && cron.validate(deepCron)) {
+      cron.schedule(deepCron, () => {
         console.log('[scheduler] Running scheduled deep scan...');
         runScan(config.load(), 'deep').catch(console.error);
       });
-      console.log(`[scheduler] Scheduled scan: ${cfg.scheduleCron}`);
-    } else {
-      console.warn(`[scheduler] Invalid cron expression: ${cfg.scheduleCron}`);
+      console.log(`[scheduler] Deep scan: ${deepCron}`);
+    }
+
+    if (!quickCron && !deepCron) {
+      console.warn('[scheduler] SCHEDULE_ENABLED=true but no cron expressions set');
     }
   }
 }

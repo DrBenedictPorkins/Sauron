@@ -92,7 +92,14 @@ function parseStatus(summary) {
 
 function getSummaryText(summary) {
   if (!summary) return null;
-  return summary.replace(/\nSTATUS:.*$/s, '').trim();
+  return summary
+    .replace(/\nSTATUS:.*$/s, '')
+    .replace(/^#+\s*Project\s*Summary:?\s*/i, '')
+    .replace(/^\*\*Project\s*Summary:?\*\*\s*/i, '')
+    .replace(/^Project\s*Summary:?\s*/i, '')
+    .replace(/^#\s+\S+\s*\n+/i, '') // "# project-name" header
+    .replace(/^#+\s*.*summary.*\n*/im, '')
+    .trim();
 }
 
 function bucketProjects(projects) {
@@ -567,9 +574,12 @@ function addChatMessage(role, content) {
 }
 
 function renderMarkdown(text) {
-  // Minimal markdown: code blocks, inline code, bold, newlines
   return text
     .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
+    .replace(/^### (.+)$/gm, '<strong style="font-size:14px">$1</strong>')
+    .replace(/^## (.+)$/gm, '<strong style="font-size:15px">$1</strong>')
+    .replace(/^# (.+)$/gm, '<strong style="font-size:16px">$1</strong>')
+    .replace(/^- (.+)$/gm, '&bull; $1')
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/\n/g, '<br>');

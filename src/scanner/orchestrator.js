@@ -1,6 +1,6 @@
 const { scanAll } = require('./index');
 const { analyze } = require('../analyzer');
-const { summarize, needsSummaryRefresh } = require('../summarizer');
+const { summarize } = require('../summarizer');
 const db = require('../db');
 
 let scan = null;
@@ -85,12 +85,8 @@ async function runScan(cfg, type = 'quick', { projectIds } = {}) {
     if (type === 'deep') {
       scan.phase = 'summarizing';
       const maxSummaries = cfg.maxSummariesPerScan || 50;
-      const toSummarize = analyzed
-        .filter(({ dbFields, transient }) => {
-          const existing = db.getProject(dbFields.id);
-          return needsSummaryRefresh(existing, transient.commitHash);
-        })
-        // Most recent projects first — they matter most
+      // Deep scan regenerates ALL summaries, most recent first
+      const toSummarize = [...analyzed]
         .sort((a, b) => (b.dbFields.last_commit_date || 0) - (a.dbFields.last_commit_date || 0))
         .slice(0, maxSummaries);
 
