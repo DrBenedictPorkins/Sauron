@@ -153,6 +153,7 @@ function makeProjectId(projectPath) {
 async function analyze(scannedProject) {
   const { path: projectPath, name, group, rootLabel, type } = scannedProject;
 
+  const hasGit = fs.existsSync(path.join(projectPath, '.git'));
   const git = await gitInfo(projectPath);
   const integrations = detectIntegrations(projectPath);
   const languages = LANGUAGE_MAP[type] || detectLanguagesFromFiles(projectPath);
@@ -173,6 +174,7 @@ async function analyze(scannedProject) {
     has_uncommitted: git?.hasUncommitted ? 1 : 0,
     has_readme: context.readme ? 1 : 0,
     has_claude_md: context.claudeMd ? 1 : 0,
+    has_git: hasGit ? 1 : 0,
     branch: git?.branch || null,
     integrations: JSON.stringify(integrations),
     first_seen_at: Date.now(),

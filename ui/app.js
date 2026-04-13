@@ -4,7 +4,7 @@ let scanPollTimer = null;
 const TYPE_LABELS = {
   python: 'Python', nodejs: 'Node.js', typescript: 'TypeScript',
   electron: 'Electron', react: 'React', nextjs: 'Next.js',
-  'react-native': 'React Native', swift: 'Swift', unknown: 'Unknown',
+  'react-native': 'React Native', swift: 'Swift', monorepo: 'Monorepo', unknown: 'Unknown',
 };
 
 const DAY = 86400000;
@@ -105,25 +105,16 @@ function getSummaryText(summary) {
 function bucketProjects(projects) {
   const now = Date.now();
   const buckets = TIME_BUCKETS.map(b => ({ ...b, projects: [] }));
-  const noDate = [];
 
   for (const p of projects) {
-    if (!p.last_commit_date) {
-      noDate.push(p);
-      continue;
-    }
-    const age = now - p.last_commit_date;
+    const date = p.last_commit_date || p.first_seen_at;
+    const age = now - date;
     for (const bucket of buckets) {
       if (age < bucket.max) {
         bucket.projects.push(p);
         break;
       }
     }
-  }
-
-  // Add no-date bucket if needed
-  if (noDate.length > 0) {
-    buckets.push({ label: 'No commit history', max: Infinity, cssClass: 'bucket-none', projects: noDate });
   }
 
   return buckets.filter(b => b.projects.length > 0);
@@ -161,7 +152,7 @@ function renderCard(p) {
       </div>
       <div class="card-flags">
         <span class="badge badge-${type}" title="Detected project type based on config files (package.json, pyproject.toml, xcodeproj, etc.)">${typeLabel}</span>
-        ${p.has_uncommitted ? '<span class="flag-uncommitted" title="This project has uncommitted changes in its git working tree">uncommitted</span>' : ''}
+        ${!p.has_git ? '<span class="flag-no-git" title="No git repository found in this project">no git</span>' : p.has_uncommitted ? '<span class="flag-uncommitted" title="This project has uncommitted changes in its git working tree">uncommitted</span>' : ''}
       </div>
     </div>
 
@@ -574,6 +565,10 @@ function addChatMessage(role, content) {
 }
 
 function renderMarkdown(text) {
+  if (window.marked) {
+    return window.marked.parse(text);
+  }
+  // fallback if marked didn't load
   return text
     .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
     .replace(/^### (.+)$/gm, '<strong style="font-size:14px">$1</strong>')
@@ -720,9 +715,42 @@ async function condenseChat() {
   document.getElementById('chatInput').focus();
 }
 
+function initChatResize() {
+  const panel = document.getElementById('chatPanel');
+  const handle = document.getElementById('chatResizeHandle');
+
+  let startX, startY, startW, startH;
+
+  handle.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    startX = e.clientX;
+    startY = e.clientY;
+    startW = panel.offsetWidth;
+    startH = panel.offsetHeight;
+
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+  });
+
+  function onMouseMove(e) {
+    const dx = startX - e.clientX;
+    const dy = startY - e.clientY;
+    const newW = Math.max(300, Math.min(window.innerWidth - 40, startW + dx));
+    const newH = Math.max(280, Math.min(window.innerHeight - 60, startH + dy));
+    panel.style.width = newW + 'px';
+    panel.style.height = newH + 'px';
+  }
+
+  function onMouseUp() {
+    document.removeEventListener('mousemove', onMouseMove);
+    document.removeEventListener('mouseup', onMouseUp);
+  }
+}
+
 async function init() {
   await reload();
   await updateScanStatus();
+  initChatResize();
 
   document.getElementById('searchInput').addEventListener('input', applyFilters);
   document.getElementById('filterType').addEventListener('change', applyFilters);

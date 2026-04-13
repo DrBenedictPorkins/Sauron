@@ -50,6 +50,22 @@ function detectProjectType(entries, dirPath) {
     }
   }
   if (names.includes('pyproject.toml') || names.includes('setup.py')) return 'python';
+
+  // No markers at root — peek into subdirectories (monorepo detection)
+  const subTypes = new Set();
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (SKIP_DIRS.has(entry.name) || entry.name.startsWith('.')) continue;
+    const subPath = path.join(dirPath, entry.name);
+    try {
+      const subNames = fs.readdirSync(subPath);
+      if (subNames.some(n => n.endsWith('.xcodeproj'))) subTypes.add('swift');
+      if (subNames.includes('package.json')) subTypes.add('nodejs');
+      if (subNames.includes('pyproject.toml') || subNames.includes('setup.py') || subNames.includes('requirements.txt')) subTypes.add('python');
+      if (subNames.includes('Cargo.toml')) subTypes.add('rust');
+    } catch {}
+  }
+  if (subTypes.size > 0) return 'monorepo';
   return 'unknown';
 }
 

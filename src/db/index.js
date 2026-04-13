@@ -62,6 +62,7 @@ function migrate(db) {
   };
   addColumn('projects', 'has_readme', 'INTEGER DEFAULT 0');
   addColumn('projects', 'has_claude_md', 'INTEGER DEFAULT 0');
+  addColumn('projects', 'has_git', 'INTEGER DEFAULT 0');
   addColumn('scan_runs', 'summaries_generated', 'INTEGER DEFAULT 0');
   addColumn('scan_runs', 'input_tokens', 'INTEGER DEFAULT 0');
   addColumn('scan_runs', 'output_tokens', 'INTEGER DEFAULT 0');
@@ -74,12 +75,12 @@ function upsertProject(p) {
     INSERT INTO projects (
       id, name, path, group_name, root_label, type, languages,
       last_commit_date, last_commit_message, last_commit_author,
-      commit_count_30d, has_uncommitted, has_readme, has_claude_md,
+      commit_count_30d, has_uncommitted, has_readme, has_claude_md, has_git,
       branch, integrations, first_seen_at, last_scanned_at
     ) VALUES (
       @id, @name, @path, @group_name, @root_label, @type, @languages,
       @last_commit_date, @last_commit_message, @last_commit_author,
-      @commit_count_30d, @has_uncommitted, @has_readme, @has_claude_md,
+      @commit_count_30d, @has_uncommitted, @has_readme, @has_claude_md, @has_git,
       @branch, @integrations, @first_seen_at, @last_scanned_at
     )
     ON CONFLICT(path) DO UPDATE SET
@@ -95,6 +96,7 @@ function upsertProject(p) {
       has_uncommitted = excluded.has_uncommitted,
       has_readme = excluded.has_readme,
       has_claude_md = excluded.has_claude_md,
+      has_git = excluded.has_git,
       branch = excluded.branch,
       integrations = excluded.integrations,
       last_scanned_at = excluded.last_scanned_at
