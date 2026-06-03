@@ -633,6 +633,7 @@ async function sendChatMessage() {
           showToolActivity(`Reading: ${data.name}...`);
         } else if (data.type === 'tool_exec') {
           const label = data.name === 'read_file' ? data.input.relative_path
+            : data.name === 'write_file' ? `writing ${data.input.relative_path}`
             : data.name === 'list_directory' ? `listing ${data.input.relative_path || '.'}`
             : data.name === 'search_files' ? `searching "${data.input.pattern}"`
             : data.name === 'git_command' ? `git ${data.input.args}`

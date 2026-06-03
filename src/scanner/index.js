@@ -30,7 +30,8 @@ function classifyDir(entries) {
   const hasGit = names.includes('.git');
   const hasProjectFile = PROJECT_MARKERS.some(m => names.includes(m));
   const hasXcodeproj = names.some(n => n.endsWith('.xcodeproj'));
-  return hasGit || hasProjectFile || hasXcodeproj;
+  const hasClaudeMd = names.includes('CLAUDE.md');
+  return hasGit || hasProjectFile || hasXcodeproj || hasClaudeMd;
 }
 
 function detectProjectType(entries, dirPath) {

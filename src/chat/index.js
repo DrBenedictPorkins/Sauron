@@ -82,6 +82,24 @@ const TOOLS = [
     },
   },
   {
+    name: 'write_file',
+    description: 'Write content to a file within the project. Creates the file (and any missing parent directories) if it does not exist, or overwrites it if it does.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        relative_path: {
+          type: 'string',
+          description: 'File path relative to project root.',
+        },
+        content: {
+          type: 'string',
+          description: 'Full content to write to the file.',
+        },
+      },
+      required: ['relative_path', 'content'],
+    },
+  },
+  {
     name: 'git_command',
     description: 'Run a read-only git command in the project directory. Only safe, read-only git subcommands are allowed (log, diff, show, status, branch, tag, blame, etc.). No push, pull, commit, checkout, reset, or any write operations.',
     input_schema: {
@@ -121,6 +139,7 @@ function executeTool(toolName, input, projectRoot) {
     case 'read_file': return readFile(projectRoot, input.relative_path, input.offset, input.limit);
     case 'get_file_info': return getFileInfo(projectRoot, input.relative_path);
     case 'search_files': return searchFiles(projectRoot, input.pattern, input.glob);
+    case 'write_file': return writeFile(projectRoot, input.relative_path, input.content);
     case 'git_command': return gitCommand(projectRoot, input.args);
     default: return { error: `Unknown tool: ${toolName}` };
   }
@@ -193,6 +212,19 @@ function readFile(projectRoot, relativePath, offset = 0, limit = 200) {
       totalLines: lines.length,
       showing: `${offset + 1}-${Math.min(offset + limit, lines.length)} of ${lines.length}`,
     };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+function writeFile(projectRoot, relativePath, content) {
+  const full = safePath(projectRoot, relativePath);
+  if (!full) return { error: 'Invalid path' };
+
+  try {
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content, 'utf8');
+    return { ok: true, path: relativePath, bytes: Buffer.byteLength(content, 'utf8') };
   } catch (err) {
     return { error: err.message };
   }
@@ -280,7 +312,8 @@ PROJECT CONTEXT:
 ${project.summary ? `AI Summary:\n${project.summary}\n` : ''}
 
 RULES:
-- You can ONLY read files within this project directory. No modifications, no writes, no deletes.
+- You are scoped to this project directory. No access outside it, no deletes.
+- You can read and write files within this project using the provided tools.
 - Use the provided tools to explore the project when you need more information.
 - Be concise. Answer questions directly.
 - If asked about something outside this project, decline politely.`;
