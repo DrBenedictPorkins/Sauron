@@ -455,4 +455,69 @@ async function* chat(project, userMessage) {
   yield { type: 'done' };
 }
 
-module.exports = { chat, clearSession, condenseSession, getSession };
+function tryParseArr(val) {
+  if (Array.isArray(val)) return val;
+  try { const r = JSON.parse(val); return Array.isArray(r) ? r : []; } catch { return []; }
+}
+
+function buildGlobalSystemPrompt(projects) {
+  const lines = [
+    'You are a project discovery assistant for the Sauron development dashboard.',
+    `You have metadata for ${projects.length} scanned projects in the user\'s development environment.`,
+    '',
+    'PROJECT INDEX:',
+    '',
+  ];
+
+  for (const p of projects) {
+    const summaryText = p.summary
+      ? p.summary.replace(/\nSTATUS:.*$/s, '').replace(/^#+.*\n/gm, '').trim().slice(0, 200)
+      : null;
+    const langs = tryParseArr(p.languages).join(', ') || p.type || 'unknown';
+    const integrations = tryParseArr(p.integrations);
+    const daysAgo = p.last_commit_date ? Math.floor((Date.now() - p.last_commit_date) / 86400000) : null;
+
+    lines.push(`### ${p.name}`);
+    lines.push(`- Path: ${p.path}`);
+    lines.push(`- Type: ${langs}`);
+    lines.push(`- Last commit: ${daysAgo !== null ? `${daysAgo}d ago` : 'no commits'}${p.last_commit_message ? ` — "${p.last_commit_message}"` : ''}`);
+    if (integrations.length) lines.push(`- Integrations: ${integrations.join(', ')}`);
+    if (summaryText) lines.push(`- Summary: ${summaryText}`);
+    lines.push('');
+  }
+
+  lines.push('RESPONSE STYLE — CRITICAL:');
+  lines.push('- Return ONLY what was asked for. Nothing else.');
+  lines.push('- If asked to find projects: return project names only, one per line. No descriptions, no dates, no headers, no grouping, no commentary.');
+  lines.push('- Add a description ONLY if the user explicitly asks for one.');
+  lines.push('- Never editorialize. Never add "most active", "note:", "tip:", or any unsolicited context.');
+  lines.push('- You cannot read files — use only the metadata above.');
+
+  return lines.join('\n');
+}
+
+async function* globalChat(projects, userMessage) {
+  const session = getSession('global');
+  session.messages.push({ role: 'user', content: userMessage });
+
+  const systemPrompt = buildGlobalSystemPrompt(projects);
+
+  const stream = getClient().messages.stream({
+    model: MODEL,
+    max_tokens: 2048,
+    system: systemPrompt,
+    messages: session.messages,
+  });
+
+  for await (const event of stream) {
+    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+      yield { type: 'text', text: event.delta.text };
+    }
+  }
+
+  const finalMessage = await stream.finalMessage();
+  session.messages.push({ role: 'assistant', content: finalMessage.content });
+  yield { type: 'done' };
+}
+
+module.exports = { chat, globalChat, clearSession, condenseSession, getSession };

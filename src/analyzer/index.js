@@ -130,7 +130,21 @@ function detectIntegrations(projectPath) {
   return [...found];
 }
 
-function readTextFile(filePath, maxChars = 3000) {
+// Deterministic activity status from git metrics — no AI needed.
+// Maps to the UI's status pills: Active, Stale (Quiet), Abandoned (Dormant).
+function computeStatus(dbFields, cfg = {}) {
+  const DAY = 86400000;
+  const activeMs = (cfg.activeCutoffDays || 30) * DAY;
+  const staleMs = (cfg.staleCutoffDays || 180) * DAY;
+  // No git or no commit history — nothing to gauge activity from.
+  if (!dbFields.has_git || !dbFields.last_commit_date) return 'Abandoned';
+  const age = Date.now() - dbFields.last_commit_date;
+  if (age <= activeMs || dbFields.commit_count_30d > 0) return 'Active';
+  if (age <= staleMs) return 'Stale';
+  return 'Abandoned';
+}
+
+function readTextFile(filePath, maxChars = 1200) {
   try {
     return fs.readFileSync(filePath, 'utf8').slice(0, maxChars);
   } catch {
@@ -150,7 +164,7 @@ function makeProjectId(projectPath) {
   return crypto.createHash('sha1').update(projectPath).digest('hex').slice(0, 12);
 }
 
-async function analyze(scannedProject) {
+async function analyze(scannedProject, cfg = {}) {
   const { path: projectPath, name, group, rootLabel, type } = scannedProject;
 
   const hasGit = fs.existsSync(path.join(projectPath, '.git'));
@@ -177,9 +191,11 @@ async function analyze(scannedProject) {
     has_git: hasGit ? 1 : 0,
     branch: git?.branch || null,
     integrations: JSON.stringify(integrations),
+    commit_hash: git?.commitHash || null,
     first_seen_at: Date.now(),
     last_scanned_at: Date.now(),
   };
+  dbFields.status = computeStatus(dbFields, cfg);
 
   const transient = {
     context,
@@ -190,4 +206,39 @@ async function analyze(scannedProject) {
   return { dbFields, transient };
 }
 
-module.exports = { analyze, getProjectContext, makeProjectId };
+const NODE_PROJECT_TYPES = new Set(['nodejs', 'typescript', 'electron', 'react', 'nextjs', 'react-native']);
+
+function checkDeps(projectPath, projectType) {
+  const { spawnSync } = require('child_process');
+  const results = [];
+
+  // Node.js
+  if (NODE_PROJECT_TYPES.has(projectType) && fs.existsSync(path.join(projectPath, 'package.json'))) {
+    if (fs.existsSync(path.join(projectPath, 'node_modules'))) {
+      const r = spawnSync('npm', ['outdated', '--json'], { cwd: projectPath, encoding: 'utf8', timeout: 30000 });
+      try {
+        const outdated = JSON.parse(r.stdout || '{}');
+        for (const [name, info] of Object.entries(outdated)) {
+          if (info.current && info.latest && info.current !== info.latest) {
+            results.push({ name, current: info.current, latest: info.latest });
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // Python
+  if (projectType === 'python' && fs.existsSync(path.join(projectPath, 'requirements.txt'))) {
+    const r = spawnSync('pip', ['list', '--outdated', '--format=json'], { cwd: projectPath, encoding: 'utf8', timeout: 30000 });
+    try {
+      const outdated = JSON.parse(r.stdout || '[]');
+      for (const pkg of outdated) {
+        results.push({ name: pkg.name, current: pkg.version, latest: pkg.latest_version });
+      }
+    } catch {}
+  }
+
+  return results;
+}
+
+module.exports = { analyze, getProjectContext, makeProjectId, checkDeps, computeStatus };

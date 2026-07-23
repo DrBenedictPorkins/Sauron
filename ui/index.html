@@ -25,8 +25,9 @@
       </div>
       <div class="header-right">
         <div class="scan-status" id="scanStatus"></div>
-        <button class="btn btn-secondary" id="btnQuickScan" title="Crawl all directories, git metadata only, no AI">Quick Scan</button>
-        <button class="btn btn-primary" id="btnDeepScan" title="Full scan + AI summaries (costs tokens)">Deep Scan</button>
+        <button class="btn btn-global-chat" id="btnGlobalChat" title="Ask AI about any project">Ask AI</button>
+        <button class="btn" id="btnSettings" title="View configuration (read-only)">Settings</button>
+        <button class="btn btn-primary" id="btnScan" title="Refresh git/dependency metadata for all projects — free, no AI calls">Quick Scan</button>
         <button class="btn btn-stop" id="btnStopScan" style="display:none" title="Stop current scan">Stop</button>
       </div>
     </header>
@@ -79,6 +80,11 @@
   <div id="modal" class="modal" style="display:none">
     <div class="modal-backdrop" id="modalBackdrop"></div>
     <div class="modal-content" id="modalContent"></div>
+  </div>
+
+  <div id="scanConfirmModal" class="modal" style="display:none">
+    <div class="modal-backdrop" id="scanConfirmBackdrop"></div>
+    <div class="modal-content modal-content-narrow" id="scanConfirmContent"></div>
   </div>
 
   <div id="chatPanel" class="chat-panel" style="display:none">

@@ -26,7 +26,7 @@ function load() {
     scanRoots: parseScanRoots(),
     ignore: parseIgnore(),
     activeCutoffDays: parseInt(process.env.ACTIVE_CUTOFF_DAYS || '30'),
-    quickScanTopN: parseInt(process.env.QUICK_SCAN_TOP_N || '20'),
+    staleCutoffDays: parseInt(process.env.STALE_CUTOFF_DAYS || '180'),
     maxSummariesPerScan: parseInt(process.env.MAX_SUMMARIES_PER_SCAN || '50'),
   };
 }

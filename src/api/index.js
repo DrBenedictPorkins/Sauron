@@ -3,7 +3,9 @@ const path = require('path');
 const db = require('../db');
 const config = require('../config');
 const { runScan, isScanInProgress, getProgress, requestStop } = require('../scanner/orchestrator');
-const { chat, clearSession, condenseSession } = require('../chat');
+const { analyze } = require('../analyzer');
+const { summarize } = require('../summarizer');
+const { chat, globalChat, clearSession, condenseSession } = require('../chat');
 
 function createApp() {
   const app = express();
@@ -32,21 +34,61 @@ function createApp() {
     res.json({ ok: true });
   });
 
+  app.post('/api/projects/:id/deep-scan-ignore', (req, res) => {
+    db.setDeepScanIgnored(req.params.id, req.body.ignored !== false);
+    res.json({ ok: true });
+  });
+
+  // On-demand AI summary for a single project (used when opening a project that
+  // has no cached summary — e.g. a dormant project skipped by auto-scans).
+  app.post('/api/projects/:id/summarize', async (req, res) => {
+    const p = db.getProject(req.params.id);
+    if (!p) return res.status(404).json({ error: 'Not found' });
+    try {
+      const cfg = config.load();
+      const scanned = { path: p.path, name: p.name, group: p.group_name, rootLabel: p.root_label, type: p.type };
+      const { dbFields, transient } = await analyze(scanned, cfg);
+      db.upsertProject(dbFields);
+      const proj = db.getProject(p.id);
+      const result = await summarize(proj, transient);
+      res.json({ summary: result?.summary || proj.summary || null, status: dbFields.status });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Scan
   app.post('/api/scan', (req, res) => {
     if (isScanInProgress()) {
       return res.status(409).json({ error: 'Scan already in progress' });
     }
-    const { type = 'deep', projectIds } = req.body;
-    const label = projectIds ? `targeted scan (${projectIds.length} projects)` : `${type} scan`;
+    const { projectIds, type = 'quick', forceRegenerate = false } = req.body;
+
+    if (type === 'deep') {
+      if (!projectIds || projectIds.length === 0) {
+        return res.status(400).json({ error: 'Deep Scan requires an explicit project selection — use a bucket or project scan.' });
+      }
+      const cap = config.load().maxSummariesPerScan || 50;
+      if (projectIds.length > cap) {
+        return res.status(400).json({ error: `Selection of ${projectIds.length} exceeds the per-scan cap of ${cap}. Deselect some projects and try again.` });
+      }
+    }
+
+    const label = type === 'deep' ? `deep scan (${projectIds.length} projects)` : (projectIds ? `quick scan (${projectIds.length} projects)` : 'quick scan (full fleet)');
     res.json({ ok: true, message: `${label} started` });
-    runScan(config.load(), type, { projectIds }).catch(console.error);
+    runScan(config.load(), type, { projectIds, forceRegenerate }).catch(console.error);
+  });
+
+  app.get('/api/scan/cost-estimate', (_req, res) => {
+    res.json({ avgCostPerSummary: db.getAverageSummaryCost() });
   });
 
   app.get('/api/scan/status', (_req, res) => {
+    const progress = getProgress();
     res.json({
       inProgress: isScanInProgress(),
-      progress: getProgress(),
+      isBackground: progress?.type === 'background',
+      progress,
       lastRun: db.getRecentScanRun() || null,
     });
   });
@@ -59,7 +101,39 @@ function createApp() {
     res.json({ ok: true });
   });
 
-  // Chat
+  // Global chat (must be before /:projectId routes)
+  app.post('/api/chat/global', async (req, res) => {
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ error: 'No message' });
+
+    const projects = db.getProjects({ includeIgnored: false });
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    try {
+      for await (const event of globalChat(projects, message)) {
+        res.write(`data: ${JSON.stringify(event)}\n\n`);
+      }
+    } catch (err) {
+      res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
+    }
+    res.end();
+  });
+
+  app.post('/api/chat/global/clear', (req, res) => {
+    clearSession('global');
+    res.json({ ok: true });
+  });
+
+  app.post('/api/chat/global/condense', async (req, res) => {
+    const condensed = await condenseSession('global');
+    if (condensed === null) return res.status(400).json({ error: 'Nothing to condense' });
+    res.json({ ok: true, condensed });
+  });
+
+  // Per-project chat
   app.post('/api/chat/:projectId', async (req, res) => {
     const project = db.getProject(req.params.projectId);
     if (!project) return res.status(404).json({ error: 'Project not found' });
@@ -118,6 +192,7 @@ function formatProject(p) {
     ...p,
     languages: tryParse(p.languages, []),
     integrations: tryParse(p.integrations, []),
+    stale_deps: tryParse(p.stale_deps, []),
   };
 }
 
