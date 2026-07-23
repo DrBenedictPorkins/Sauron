@@ -4,6 +4,8 @@
 
 Sauron is a local dashboard that scans your development directories, tracks every project's git activity, flags uncommitted changes, detects tech stacks and integrations, and generates AI-powered summaries. It groups projects by how recently they were touched so you can see at a glance what needs your attention.
 
+https://github.com/user-attachments/assets/13e725c0-e3db-44cc-b73b-fa044fd4c79e
+
 ![Dashboard](assets/screenshots/dashboard.jpeg)
 
 Projects are organized into temporal buckets (last 7 days, 14 days, 30 days, etc.) with color-coded sections. Each card shows the project type, uncommitted status, detected integrations, AI summary, and last commit info.
