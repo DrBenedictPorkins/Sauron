@@ -1,9 +1,10 @@
 const { scanAll } = require('./index');
-const { analyze } = require('../analyzer');
-const { summarize } = require('../summarizer');
+const { analyze, checkDeps } = require('../analyzer');
+const { summarize, needsSummaryRefresh } = require('../summarizer');
 const db = require('../db');
 
 let scan = null;
+const activeProjectIds = new Set();
 
 function getProgress() {
   if (!scan) return null;
@@ -18,6 +19,7 @@ function getProgress() {
     inputTokens: scan.inputTokens,
     outputTokens: scan.outputTokens,
     estimatedCost: scan.estimatedCost,
+    activeProjectIds: [...activeProjectIds],
   };
 }
 
@@ -25,10 +27,9 @@ function requestStop() {
   if (scan) scan.stopRequested = true;
 }
 
-async function runScan(cfg, type = 'quick', { projectIds } = {}) {
-  if (scan) {
-    return { skipped: true, reason: 'Scan already in progress' };
-  }
+async function runScan(cfg, type = 'quick', { projectIds, forceRegenerate = false } = {}) {
+  if (scan) return { skipped: true, reason: 'Scan already in progress' };
+  const deep = type !== 'quick';
 
   scan = {
     type,
@@ -47,7 +48,7 @@ async function runScan(cfg, type = 'quick', { projectIds } = {}) {
   const runId = db.startScanRun(type);
 
   try {
-    // Phase 1: discover projects
+    // Phase 1: discover
     let projectList;
     if (projectIds && projectIds.length > 0) {
       const idSet = new Set(projectIds);
@@ -56,71 +57,93 @@ async function runScan(cfg, type = 'quick', { projectIds } = {}) {
         .filter(p => idSet.has(p.id))
         .map(p => ({ path: p.path, name: p.name, group: p.group_name, rootLabel: p.root_label, type: p.type }));
     } else {
-      // Both quick and deep start with full directory crawl
       projectList = scanAll(cfg);
     }
 
     scan.projectsTotal = projectList.length;
     scan.phase = 'analyzing';
 
-    // Phase 2: analyze each project (git metadata, integrations, etc.)
+    // Phase 2: analyze (git metadata, integrations, languages)
     const analyzed = [];
     for (const p of projectList) {
       if (scan.stopRequested) break;
       scan.currentProjectName = p.name;
       scan.projectsCurrent++;
+      activeProjectIds.add(p.path); // use path as temp key before we have dbFields
 
-      const result = await analyze(p);
+      const result = await analyze(p, cfg);
       db.upsertProject(result.dbFields);
+      activeProjectIds.delete(p.path);
+      activeProjectIds.add(result.dbFields.id);
       analyzed.push(result);
     }
 
     if (scan.stopRequested) {
+      activeProjectIds.clear();
       db.finishScanRun(runId, analyzed.length, 0);
       return { success: true, stopped: true, found: analyzed.length };
     }
 
-    // Phase 3: AI summaries — ONLY on deep scan
-    let successCount = 0;
-    if (type === 'deep') {
-      scan.phase = 'summarizing';
-      const maxSummaries = cfg.maxSummariesPerScan || 50;
-      // Deep scan regenerates ALL summaries, most recent first
-      const toSummarize = [...analyzed]
-        .sort((a, b) => (b.dbFields.last_commit_date || 0) - (a.dbFields.last_commit_date || 0))
-        .slice(0, maxSummaries);
-
-      scan.summariesTotal = toSummarize.length;
-
-      for (const { dbFields, transient } of toSummarize) {
-        if (scan.stopRequested) break;
-        scan.summariesCurrent++;
-        scan.currentProjectName = dbFields.name;
-
-        const proj = db.getProject(dbFields.id);
-        if (!proj) continue;
-
-        const result = await summarize(proj, transient);
-        if (result) {
-          scan.inputTokens += result.inputTokens;
-          scan.outputTokens += result.outputTokens;
-          scan.estimatedCost += result.cost;
-          successCount++;
-        }
+    // Phase 3: dep staleness check — skip if same commit hash
+    scan.phase = 'checking deps';
+    for (const { dbFields, transient } of analyzed) {
+      if (scan.stopRequested) break;
+      const proj = db.getProject(dbFields.id);
+      if (proj && proj.deps_commit_hash && proj.deps_commit_hash === transient.commitHash) {
+        activeProjectIds.delete(dbFields.id);
+        continue;
       }
+      scan.currentProjectName = dbFields.name;
+      const staleDeps = checkDeps(dbFields.path, dbFields.type);
+      db.updateDeps(dbFields.id, staleDeps, transient.commitHash);
+      activeProjectIds.delete(dbFields.id);
     }
 
-    const tokenUsage = {
+    // Phase 4: AI summaries — only for Deep Scans (always an explicit project
+    // selection made by the user via the confirmation checklist). Re-check
+    // needsSummaryRefresh here in case state changed since the dialog opened,
+    // unless force-regenerating (the single-project explicit trigger).
+    let toSummarize = [];
+    if (deep) {
+      scan.phase = 'summarizing';
+      toSummarize = analyzed.filter(({ dbFields, transient }) =>
+        projectIds.includes(dbFields.id) &&
+        needsSummaryRefresh(db.getProject(dbFields.id), transient.commitHash, forceRegenerate));
+    }
+
+    scan.summariesTotal = toSummarize.length;
+    let successCount = 0;
+
+    for (const { dbFields, transient } of toSummarize) {
+      if (scan.stopRequested) break;
+      scan.summariesCurrent++;
+      scan.currentProjectName = dbFields.name;
+      activeProjectIds.add(dbFields.id);
+
+      const proj = db.getProject(dbFields.id);
+      if (!proj) { activeProjectIds.delete(dbFields.id); continue; }
+
+      const result = await summarize(proj, transient);
+      if (result) {
+        scan.inputTokens += result.inputTokens;
+        scan.outputTokens += result.outputTokens;
+        scan.estimatedCost += result.cost;
+        successCount++;
+      }
+      activeProjectIds.delete(dbFields.id);
+    }
+
+    activeProjectIds.clear();
+    db.finishScanRun(runId, analyzed.length, successCount, {
       inputTokens: scan.inputTokens,
       outputTokens: scan.outputTokens,
       estimatedCost: scan.estimatedCost,
       summariesGenerated: successCount,
-    };
-
-    db.finishScanRun(runId, analyzed.length, successCount, tokenUsage);
-    return { success: true, found: analyzed.length, summarized: successCount, tokenUsage };
+    });
+    return { success: true, found: analyzed.length, summarized: successCount };
   } catch (err) {
     console.error('Scan error:', err);
+    activeProjectIds.clear();
     db.finishScanRun(runId, 0, 0);
     return { success: false, error: err.message };
   } finally {

@@ -9,11 +9,18 @@ const TYPE_LABELS = {
 
 const DAY = 86400000;
 
+const STATUS_DISPLAY = {
+  'Active':      'Active',
+  'Stale':       'Quiet',
+  'Abandoned':   'Dormant',
+  'Early Stage': 'New',
+};
+
 const STATUS_TOOLTIPS = {
-  'Active': 'Commits within the last 30 days — this project is being worked on',
-  'Stale': 'No commits in 30+ days but the project appears incomplete or in-progress',
-  'Abandoned': 'No meaningful activity for a long time — likely shelved or forgotten',
-  'Early Stage': 'Recently created with minimal commits — just getting started',
+  'Active':      'Commits in the last 30 days',
+  'Stale':       'No commits in 30+ days',
+  'Abandoned':   'No meaningful activity for a long time — likely shelved',
+  'Early Stage': 'Recently created, minimal commits',
 };
 
 const TIME_BUCKETS = [
@@ -25,6 +32,8 @@ const TIME_BUCKETS = [
   { label: '90 – 120 days ago', max: 120 * DAY, cssClass: 'bucket-120d' },
   { label: 'Older',           max: Infinity,   cssClass: 'bucket-old' },
 ];
+
+const NO_HISTORY_BUCKET = { label: 'No git history', cssClass: 'bucket-none' };
 
 function esc(str) {
   if (!str) return '';
@@ -47,19 +56,34 @@ async function fetchScanStatus() {
   return res.json();
 }
 
-async function triggerScan(type, projectIds) {
-  const body = { type };
+async function triggerScan(projectIds, type = 'quick', forceRegenerate = false) {
+  const body = { type, forceRegenerate };
   if (projectIds) body.projectIds = projectIds;
   const res = await fetch('/api/scan', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Scan request failed');
+  return data;
+}
+
+async function fetchCostEstimate() {
+  const res = await fetch('/api/scan/cost-estimate');
   return res.json();
 }
 
 async function ignoreProject(id, ignored) {
   await fetch(`/api/projects/${id}/ignore`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ignored }),
+  });
+}
+
+async function setDeepScanIgnored(id, ignored) {
+  await fetch(`/api/projects/${id}/deep-scan-ignore`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ignored }),
@@ -90,6 +114,21 @@ function parseStatus(summary) {
   return match[1].replace(/\s+/g, ' ').trim();
 }
 
+// Status is now computed deterministically server-side and stored on the project.
+// Fall back to parsing legacy summaries that still embed a "STATUS:" line.
+function projectStatus(p) {
+  return p.status || parseStatus(p.summary);
+}
+
+// A summary is outdated when the project has changed commit since it was
+// generated. No commit hash at all means no version signal (e.g. no git) —
+// treated as not outdated, matching needsSummaryRefresh's server-side logic.
+function summaryOutdated(p) {
+  if (!p.summary) return false;
+  if (!p.commit_hash) return false;
+  return p.commit_hash !== p.summary_commit_hash;
+}
+
 function getSummaryText(summary) {
   if (!summary) return null;
   return summary
@@ -105,10 +144,17 @@ function getSummaryText(summary) {
 function bucketProjects(projects) {
   const now = Date.now();
   const buckets = TIME_BUCKETS.map(b => ({ ...b, projects: [] }));
+  const noHistory = { ...NO_HISTORY_BUCKET, projects: [] };
 
   for (const p of projects) {
-    const date = p.last_commit_date || p.first_seen_at;
-    const age = now - date;
+    // Projects with no commit history (no git, or git with no commits) have no
+    // meaningful position on the activity timeline — bucket them separately
+    // rather than treating first_seen_at as recent activity.
+    if (!p.last_commit_date) {
+      noHistory.projects.push(p);
+      continue;
+    }
+    const age = now - p.last_commit_date;
     for (const bucket of buckets) {
       if (age < bucket.max) {
         bucket.projects.push(p);
@@ -117,16 +163,19 @@ function bucketProjects(projects) {
     }
   }
 
-  return buckets.filter(b => b.projects.length > 0);
+  return [...buckets, noHistory].filter(b => b.projects.length > 0);
 }
 
 function renderCard(p) {
   const type = p.type || 'unknown';
-  const typeLabel = TYPE_LABELS[type] || type;
+  const typeLabel = type !== 'unknown' ? (TYPE_LABELS[type] || type) : null;
   const integrations = Array.isArray(p.integrations) ? p.integrations : [];
-  const status = parseStatus(p.summary);
+  const status = projectStatus(p);
+  const statusDisplay = STATUS_DISPLAY[status] || status;
   const summaryText = getSummaryText(p.summary);
   const statusClass = status ? `status-${status.split(' ')[0]}` : '';
+
+  const staleDeps = Array.isArray(p.stale_deps) ? p.stale_deps : [];
 
   const card = document.createElement('div');
   card.className = `project-card${p.has_uncommitted ? ' has-uncommitted' : ''}${p.ignored ? ' ignored' : ''}`;
@@ -151,17 +200,21 @@ function renderCard(p) {
         ${docBadges ? `<div class="doc-flags-inline">${docBadges}</div>` : ''}
       </div>
       <div class="card-flags">
-        <span class="badge badge-${type}" title="Detected project type based on config files (package.json, pyproject.toml, xcodeproj, etc.)">${typeLabel}</span>
-        ${!p.has_git ? '<span class="flag-no-git" title="No git repository found in this project">no git</span>' : p.has_uncommitted ? '<span class="flag-uncommitted" title="This project has uncommitted changes in its git working tree">uncommitted</span>' : ''}
+        ${typeLabel ? `<span class="badge badge-${type}" title="Detected project type">${typeLabel}</span>` : ''}
+        ${!p.has_git ? '<span class="flag-no-git" title="No git repository">no git</span>' : p.has_uncommitted ? '<span class="flag-uncommitted" title="Uncommitted changes present">uncommitted</span>' : ''}
+        ${staleDeps.length > 0 ? `<span class="flag-outdated" title="${staleDeps.map(d => `${d.name}: ${d.current} → ${d.latest}`).join('\n')}">${staleDeps.length} outdated deps</span>` : ''}
       </div>
     </div>
 
     ${summaryText
       ? `<div class="card-summary">${renderMarkdown(esc(summaryText))}</div>`
-      : `<div class="card-summary no-summary" title="Run a Deep Scan or click Scan &amp; Summarize to generate an AI summary">No summary yet</div>`
+      : `<div class="card-summary no-summary" title="Run a Deep Scan (bucket or project) to generate an AI summary">No summary yet</div>`
     }
 
-    ${status ? `<div class="card-status-line"><span class="status-pill ${statusClass}" title="${STATUS_TOOLTIPS[status] || ''}">${status}</span></div>` : ''}
+    ${status || summaryOutdated(p) ? `<div class="card-status-line">
+      ${status ? `<span class="status-pill ${statusClass}" title="${STATUS_TOOLTIPS[status] || ''}">${statusDisplay}</span>` : ''}
+      ${summaryOutdated(p) ? '<span class="status-pill status-outdated" title="Project changed since this summary was generated — run a Deep Scan to refresh it">Outdated</span>' : ''}
+    </div>` : ''}
 
     ${integrations.length > 0 ? `
       <div class="card-integrations">
@@ -202,19 +255,26 @@ function renderTimeline(projects) {
       <div class="timeline-marker"></div>
       <div class="timeline-label">${bucket.label}</div>
       <div class="timeline-count">${bucket.projects.length} project${bucket.projects.length !== 1 ? 's' : ''}</div>
-      <button class="btn-bucket-scan" title="Scan only this group">Scan</button>
+      <div class="timeline-header-actions">
+        <button class="btn-bucket-scan btn-bucket-scan-quick" title="Refresh metadata for this group — free, no AI calls">Quick Scan</button>
+        <button class="btn-bucket-scan btn-bucket-scan-deep" title="Generate AI summaries for this group">Deep Scan</button>
+      </div>
     `;
 
-    const scanBtn = header.querySelector('.btn-bucket-scan');
     const ids = bucket.projects.map(p => p.id);
-    scanBtn.addEventListener('click', () => {
-      scanBtn.disabled = true;
-      scanBtn.textContent = 'Scanning...';
+
+    const quickBtn = header.querySelector('.btn-bucket-scan-quick');
+    quickBtn.addEventListener('click', () => {
+      quickBtn.disabled = true;
+      quickBtn.textContent = 'Scanning...';
       setScanUIState(true);
-      document.getElementById('scanStatus').textContent = `Scanning ${bucket.label} (${ids.length})...`;
+      document.getElementById('scanStatus').textContent = `Quick scanning ${bucket.label} (${ids.length})...`;
       document.getElementById('scanStatus').className = 'scan-status scanning';
-      triggerScan('targeted', ids).then(() => startPolling());
+      triggerScan(ids, 'quick').then(() => startPolling());
     });
+
+    const deepBtn = header.querySelector('.btn-bucket-scan-deep');
+    deepBtn.addEventListener('click', () => openBucketDeepScanConfirm(bucket));
 
     section.appendChild(header);
 
@@ -283,9 +343,11 @@ function openModal(p) {
   const content = document.getElementById('modalContent');
   const integrations = Array.isArray(p.integrations) ? p.integrations : [];
   const languages = Array.isArray(p.languages) ? p.languages : [];
-  const status = parseStatus(p.summary);
+  const status = projectStatus(p);
+  const statusDisplay = STATUS_DISPLAY[status] || status;
   const summaryText = getSummaryText(p.summary);
   const statusClass = status ? `status-${status.split(' ')[0]}` : '';
+  const modalTypeLabel = p.type && p.type !== 'unknown' ? (TYPE_LABELS[p.type] || p.type) : null;
 
   content.innerHTML = `
     <button class="modal-close" id="modalClose">&times;</button>
@@ -301,28 +363,32 @@ function openModal(p) {
     </div>
 
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
-      <span class="badge badge-${p.type}">${TYPE_LABELS[p.type] || p.type}</span>
+      ${modalTypeLabel ? `<span class="badge badge-${p.type}">${modalTypeLabel}</span>` : ''}
       ${p.has_uncommitted ? '<span class="flag-uncommitted">uncommitted changes</span>' : ''}
-      ${status ? `<span class="status-pill ${statusClass}" title="${STATUS_TOOLTIPS[status] || ''}">${status}</span>` : '<span style="font-size:10px;color:var(--text-muted)">no status yet</span>'}
+      ${status ? `<span class="status-pill ${statusClass}" title="${STATUS_TOOLTIPS[status] || ''}">${statusDisplay}</span>` : ''}
+      ${summaryOutdated(p) ? '<span class="status-pill status-outdated" title="Project changed since this summary was generated">Outdated</span>' : ''}
+      ${p.deep_scan_ignored ? '<span class="status-pill status-Abandoned" title="This project is excluded from Deep Scan AI summaries">Skipping AI</span>' : ''}
     </div>
 
     <div class="modal-section">
       <div class="modal-section-label">Summary</div>
-      <div class="modal-section-body" id="modalSummary">${summaryText ? renderMarkdown(esc(summaryText)) : '<span style="color:var(--text-muted);font-style:italic">No summary yet — click Scan &amp; Summarize to generate one.</span>'}</div>
+      <div class="modal-section-body" id="modalSummary">${summaryText ? renderMarkdown(esc(summaryText)) : '<span style="color:var(--text-muted);font-style:italic">No summary yet — run a Deep Scan to generate one.</span>'}</div>
     </div>
 
     <div class="modal-section">
       <div class="modal-section-label">Details</div>
       <div class="modal-section-body">
         <table style="border-collapse:collapse;width:100%;">
-          ${row('Group', p.group_name || '—')}
-          ${row('Root', p.root_label || '—')}
+          ${p.group_name ? row('Group', p.group_name) : ''}
+          ${row('Scan root', p.root_label || '—')}
           ${row('Languages', languages.join(', ') || '—')}
           ${row('Branch', p.branch || '—')}
-          ${row('Last commit', p.last_commit_date ? new Date(p.last_commit_date).toLocaleString() : '—')}
-          ${row('Last message', p.last_commit_message || '—')}
-          ${row('Commits (30d)', p.commit_count_30d || 0)}
+          ${row('Last commit', p.last_commit_date
+            ? `${new Date(p.last_commit_date).toLocaleString()}${p.last_commit_message ? ` &mdash; <span style="color:var(--text-muted)">${esc(p.last_commit_message)}</span>` : ''}`
+            : '—', true)}
+          ${row('Recent commits', p.commit_count_30d || 0)}
           ${row('Docs', [p.has_readme ? 'README.md' : null, p.has_claude_md ? 'CLAUDE.md' : null].filter(Boolean).join(', ') || 'none')}
+          ${Array.isArray(p.stale_deps) && p.stale_deps.length > 0 ? row('Outdated deps', p.stale_deps.map(d => `${d.name} ${d.current}→${d.latest}`).join(', ')) : ''}
         </table>
       </div>
     </div>
@@ -337,15 +403,47 @@ function openModal(p) {
     ` : ''}
 
     <div class="modal-actions">
-      <button class="btn btn-primary" id="btnDeepScanProject">Scan &amp; Summarize</button>
-      <button class="btn btn-ai-chat" id="btnAIChat">AI Chat</button>
-      <button class="btn btn-secondary" id="btnIgnoreToggle" style="margin-left:auto">
-        ${p.ignored ? 'Unignore project' : 'Ignore project'}
-      </button>
+      <button class="btn btn-secondary" id="btnQuickScanProject" title="Refresh git/dependency metadata for this project — free, no AI calls">Quick Scan</button>
+      <button class="btn btn-primary" id="btnDeepScanProject" title="Generate a fresh AI summary for this project">Deep Scan</button>
+      <button class="btn btn-ai-chat" id="btnAIChat" style="margin-left:auto">AI Chat</button>
+    </div>
+    <div class="modal-settings-row">
+      <span class="modal-settings-label">Project settings</span>
+      <div class="modal-settings-toggles">
+        <button class="btn-flag-toggle" id="btnDeepScanIgnoreToggle" title="Excludes this project from Deep Scan AI summaries — metadata still refreshes normally">
+          ${p.deep_scan_ignored ? 'Include in Deep Scans' : 'Skip AI summaries'}
+        </button>
+        <button class="btn-flag-toggle" id="btnIgnoreToggle" title="Hides this project from the dashboard entirely">
+          ${p.ignored ? 'Unignore project' : 'Ignore project'}
+        </button>
+      </div>
     </div>
   `;
 
   modal.style.display = 'flex';
+
+  // On-demand: dormant projects are skipped by auto-scans to save tokens, so if
+  // there's no cached summary, generate one lazily the first time it's opened.
+  if (!p.summary) {
+    const summaryEl = document.getElementById('modalSummary');
+    summaryEl.innerHTML = '<span style="color:var(--accent);font-style:italic">Generating summary…</span>';
+    fetch(`/api/projects/${p.id}/summarize`, { method: 'POST' })
+      .then(r => r.json())
+      .then(async (data) => {
+        const el = document.getElementById('modalSummary');
+        if (!el) return; // modal closed or switched projects
+        if (data.summary) {
+          el.innerHTML = renderMarkdown(esc(getSummaryText(data.summary)));
+          await reload();
+        } else {
+          el.innerHTML = '<span style="color:var(--text-muted);font-style:italic">Could not generate summary.</span>';
+        }
+      })
+      .catch(() => {
+        const el = document.getElementById('modalSummary');
+        if (el) el.innerHTML = '<span style="color:var(--text-muted);font-style:italic">Could not generate summary.</span>';
+      });
+  }
 
   document.getElementById('modalClose').onclick = closeModal;
   document.getElementById('modalBackdrop').onclick = closeModal;
@@ -372,29 +470,19 @@ function openModal(p) {
     openChat(p);
   };
 
-  document.getElementById('btnDeepScanProject').onclick = () => {
-    const btn = document.getElementById('btnDeepScanProject');
-    const summaryEl = document.getElementById('modalSummary');
+  document.getElementById('btnQuickScanProject').onclick = () => {
+    const btn = document.getElementById('btnQuickScanProject');
     btn.disabled = true;
-    btn.textContent = 'Analyzing...';
-    summaryEl.innerHTML = '<span style="color:var(--accent);font-style:italic">Scanning project and generating summary...</span>';
+    btn.textContent = 'Scanning...';
+    triggerScan([p.id], 'quick').then(() => pollProjectScan(p.id, btn, 'Scanning...'));
+  };
 
-    triggerScan('deep', [p.id]).then(() => {
-      const poll = setInterval(async () => {
-        const s = await fetchScanStatus();
-        if (s.progress) {
-          const phase = s.progress.phase;
-          if (phase === 'analyzing') btn.textContent = 'Analyzing...';
-          else if (phase === 'summarizing') btn.textContent = 'Generating summary...';
-        }
-        if (!s.inProgress) {
-          clearInterval(poll);
-          await reload();
-          const updated = allProjects.find(x => x.id === p.id);
-          if (updated) openModal(updated);
-        }
-      }, 1000);
-    });
+  document.getElementById('btnDeepScanProject').onclick = () => openProjectDeepScanConfirm(p);
+
+  document.getElementById('btnDeepScanIgnoreToggle').onclick = async () => {
+    await setDeepScanIgnored(p.id, !p.deep_scan_ignored);
+    closeModal();
+    await reload();
   };
 
   document.getElementById('btnIgnoreToggle').onclick = async () => {
@@ -404,10 +492,29 @@ function openModal(p) {
   };
 }
 
-function row(label, value) {
+// Polls scan status until it finishes, updating `btn`'s label, then reloads
+// and reopens the project's modal so the refreshed data is visible.
+function pollProjectScan(projectId, btn, analyzingLabel) {
+  const poll = setInterval(async () => {
+    const s = await fetchScanStatus();
+    if (s.progress && btn) {
+      const phase = s.progress.phase;
+      if (phase === 'analyzing') btn.textContent = analyzingLabel;
+      else if (phase === 'summarizing') btn.textContent = 'Generating summary...';
+    }
+    if (!s.inProgress) {
+      clearInterval(poll);
+      await reload();
+      const updated = allProjects.find(x => x.id === projectId);
+      if (updated) openModal(updated);
+    }
+  }, 1000);
+}
+
+function row(label, value, raw) {
   return `<tr>
     <td style="padding:3px 12px 3px 0;color:var(--text-muted);font-size:11px;white-space:nowrap;vertical-align:top">${label}</td>
-    <td style="padding:3px 0;font-size:12px;color:var(--text-dim)">${esc(String(value))}</td>
+    <td style="padding:3px 0;font-size:12px;color:var(--text-dim)">${raw ? String(value) : esc(String(value))}</td>
   </tr>`;
 }
 
@@ -416,11 +523,202 @@ function closeModal() {
   closeChat();
 }
 
+// --- Deep Scan confirmation ---
+// Deep Scan never fires from a single click without review: bucket scans show a
+// checklist (large groups may not need every project touched), single-project
+// scans show a lightweight confirm. Both show a real historical cost estimate
+// rather than a fabricated per-project "complexity" score, since AI summary
+// cost is flat per project (bounded prompt) — see summarizer/index.js.
+
+function closeScanConfirm() {
+  document.getElementById('scanConfirmModal').style.display = 'none';
+}
+
+function formatCostEstimate(avgCostPerSummary, count) {
+  if (avgCostPerSummary == null) return 'No cost history yet — first Deep Scan will establish a baseline.';
+  return `~$${(avgCostPerSummary * count).toFixed(4)} estimated (${count} × ~$${avgCostPerSummary.toFixed(4)} avg/summary)`;
+}
+
+async function openBucketDeepScanConfirm(bucket) {
+  const modal = document.getElementById('scanConfirmModal');
+  const content = document.getElementById('scanConfirmContent');
+  const candidates = bucket.projects.filter(p => !p.summary || summaryOutdated(p));
+
+  if (candidates.length === 0) {
+    content.innerHTML = `
+      <button class="modal-close" id="scanConfirmClose">&times;</button>
+      <div class="modal-title">Deep Scan — ${esc(bucket.label)}</div>
+      <p style="color:var(--text-muted);font-size:13px">All ${bucket.projects.length} project${bucket.projects.length !== 1 ? 's' : ''} in this group already have up-to-date summaries.</p>
+      <div class="modal-actions"><button class="btn btn-secondary" id="scanConfirmCancel">Close</button></div>
+    `;
+    modal.style.display = 'flex';
+    document.getElementById('scanConfirmClose').onclick = closeScanConfirm;
+    document.getElementById('scanConfirmCancel').onclick = closeScanConfirm;
+    document.getElementById('scanConfirmBackdrop').onclick = closeScanConfirm;
+    return;
+  }
+
+  const [{ avgCostPerSummary }, cfg] = await Promise.all([
+    fetchCostEstimate(),
+    fetch('/api/config').then(r => r.json()).catch(() => null),
+  ]);
+  const cap = cfg?.maxSummariesPerScan ?? Infinity;
+
+  content.innerHTML = `
+    <button class="modal-close" id="scanConfirmClose">&times;</button>
+    <div class="modal-title">Deep Scan — ${esc(bucket.label)}</div>
+    <p style="color:var(--text-muted);font-size:12px;margin-bottom:12px">Review the projects below — uncheck any you don't want summarized right now.</p>
+    <div class="scan-confirm-list" id="scanConfirmList">
+      ${candidates.map(p => `
+        <label class="scan-confirm-row">
+          <input type="checkbox" value="${p.id}" ${p.deep_scan_ignored ? '' : 'checked'} />
+          <span>${esc(p.user_label || p.name)}</span>
+          ${p.deep_scan_ignored ? '<span class="scan-confirm-note">skip-AI</span>' : ''}
+        </label>
+      `).join('')}
+    </div>
+    <div class="scan-confirm-summary" id="scanConfirmSummary"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="scanConfirmCancel">Cancel</button>
+      <button class="btn btn-primary" id="scanConfirmGo" style="margin-left:auto">Run Deep Scan</button>
+    </div>
+  `;
+  modal.style.display = 'flex';
+
+  const list = document.getElementById('scanConfirmList');
+  const summaryEl = document.getElementById('scanConfirmSummary');
+  const goBtn = document.getElementById('scanConfirmGo');
+
+  function refresh() {
+    const selected = [...list.querySelectorAll('input:checked')].map(i => i.value);
+    if (selected.length === 0) {
+      summaryEl.textContent = 'Select at least one project.';
+      goBtn.disabled = true;
+    } else if (selected.length > cap) {
+      summaryEl.textContent = `${selected.length} selected exceeds the per-scan cap of ${cap} — deselect some.`;
+      goBtn.disabled = true;
+    } else {
+      summaryEl.textContent = formatCostEstimate(avgCostPerSummary, selected.length);
+      goBtn.disabled = false;
+    }
+    return selected;
+  }
+  list.addEventListener('change', refresh);
+  refresh();
+
+  document.getElementById('scanConfirmClose').onclick = closeScanConfirm;
+  document.getElementById('scanConfirmCancel').onclick = closeScanConfirm;
+  document.getElementById('scanConfirmBackdrop').onclick = closeScanConfirm;
+
+  goBtn.onclick = () => {
+    const selected = refresh();
+    if (selected.length === 0 || selected.length > cap) return;
+    goBtn.disabled = true;
+    goBtn.textContent = 'Starting...';
+    triggerScan(selected, 'deep').then(() => {
+      closeScanConfirm();
+      setScanUIState(true);
+      document.getElementById('scanStatus').textContent = `Deep scanning ${bucket.label} (${selected.length})...`;
+      document.getElementById('scanStatus').className = 'scan-status scanning';
+      startPolling();
+    }).catch(err => {
+      summaryEl.textContent = err.message;
+      goBtn.disabled = false;
+      goBtn.textContent = 'Run Deep Scan';
+    });
+  };
+}
+
+async function openProjectDeepScanConfirm(p) {
+  const modal = document.getElementById('scanConfirmModal');
+  const content = document.getElementById('scanConfirmContent');
+
+  const { avgCostPerSummary } = await fetchCostEstimate();
+
+  content.innerHTML = `
+    <button class="modal-close" id="scanConfirmClose">&times;</button>
+    <div class="modal-title">Deep Scan — ${esc(p.user_label || p.name)}</div>
+    <p style="color:var(--text-muted);font-size:13px;margin-bottom:6px">${formatCostEstimate(avgCostPerSummary, 1)}</p>
+    <p style="color:var(--text-muted);font-size:13px;margin-bottom:6px">Also re-checks dependencies, which may take a few seconds.</p>
+    ${p.deep_scan_ignored ? '<p style="color:var(--warning);font-size:13px">This project is marked to skip AI summaries — this run overrides that once; the flag itself won\'t change.</p>' : ''}
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="scanConfirmCancel">Cancel</button>
+      <button class="btn btn-primary" id="scanConfirmGo" style="margin-left:auto">Run Deep Scan</button>
+    </div>
+  `;
+  modal.style.display = 'flex';
+
+  document.getElementById('scanConfirmClose').onclick = closeScanConfirm;
+  document.getElementById('scanConfirmCancel').onclick = closeScanConfirm;
+  document.getElementById('scanConfirmBackdrop').onclick = closeScanConfirm;
+
+  document.getElementById('scanConfirmGo').onclick = () => {
+    closeScanConfirm();
+    const btn = document.getElementById('btnDeepScanProject');
+    const summaryEl = document.getElementById('modalSummary');
+    if (btn) { btn.disabled = true; btn.textContent = 'Analyzing...'; }
+    if (summaryEl) summaryEl.innerHTML = '<span style="color:var(--accent);font-style:italic">Scanning project and generating summary...</span>';
+    triggerScan([p.id], 'deep', true).then(() => pollProjectScan(p.id, btn, 'Analyzing...'));
+  };
+}
+
+async function openSettings() {
+  const modal = document.getElementById('modal');
+  const content = document.getElementById('modalContent');
+
+  let cfg;
+  try {
+    cfg = await fetch('/api/config').then(r => r.json());
+  } catch {
+    cfg = null;
+  }
+
+  const roots = (cfg?.scanRoots || []);
+  const ignore = (cfg?.ignore || []);
+
+  const rootsHtml = roots.length
+    ? roots.map(r => `<div class="settings-kv"><span class="settings-key">${esc(r.label)}</span><span class="settings-val">${esc(r.path)}</span></div>`).join('')
+    : '<div class="settings-empty">None configured</div>';
+
+  const ignoreHtml = ignore.length
+    ? ignore.map(p => `<div class="settings-val">${esc(p)}</div>`).join('')
+    : '<div class="settings-empty">None</div>';
+
+  content.innerHTML = `
+    <button class="modal-close" id="modalClose">&times;</button>
+    <div class="modal-title">Settings</div>
+    <div class="modal-path"><span>Read-only — edit <code>.env</code> and restart the server to change.</span></div>
+
+    <div class="modal-section">
+      <div class="modal-section-label">Scan Roots</div>
+      <div class="modal-section-body">${rootsHtml}</div>
+    </div>
+
+    <div class="modal-section">
+      <div class="modal-section-label">Ignore Paths</div>
+      <div class="modal-section-body">${ignoreHtml}</div>
+    </div>
+
+    <div class="modal-section">
+      <div class="modal-section-label">Scan Limits</div>
+      <div class="modal-section-body">
+        <div class="settings-kv"><span class="settings-key">Active cutoff</span><span class="settings-val">${esc(String(cfg?.activeCutoffDays ?? '—'))} days</span></div>
+        <div class="settings-kv"><span class="settings-key">Max summaries / Deep Scan</span><span class="settings-val">${esc(String(cfg?.maxSummariesPerScan ?? '—'))}</span></div>
+      </div>
+    </div>
+  `;
+
+  modal.style.display = 'flex';
+  document.getElementById('modalClose').onclick = closeModal;
+  document.getElementById('modalBackdrop').onclick = closeModal;
+}
+
 // --- Scan polling ---
 
 const PHASE_LABELS = {
   discovering: 'Discovering projects...',
   analyzing: 'Analyzing',
+  'checking deps': 'Checking deps',
   summarizing: 'Generating summaries',
 };
 
@@ -442,49 +740,117 @@ function formatProgress(progress) {
 }
 
 function setScanUIState(scanning) {
-  const btnQ = document.getElementById('btnQuickScan');
-  const btnD = document.getElementById('btnDeepScan');
+  const btnScan = document.getElementById('btnScan');
   const btnStop = document.getElementById('btnStopScan');
-  btnQ.style.display = scanning ? 'none' : '';
-  btnD.style.display = scanning ? 'none' : '';
+  btnScan.style.display = scanning ? 'none' : '';
   btnStop.style.display = scanning ? '' : 'none';
   btnStop.disabled = false;
   if (!scanning) {
-    btnQ.disabled = true;
-    btnD.disabled = true;
-    setTimeout(() => {
-      btnQ.disabled = false;
-      btnD.disabled = false;
-    }, 1500);
+    btnScan.disabled = true;
+    setTimeout(() => { btnScan.disabled = false; }, 1500);
   }
+}
+
+function updateScanningCards(activeIds) {
+  const idSet = new Set(activeIds || []);
+  document.querySelectorAll('.project-card').forEach(card => {
+    card.classList.toggle('is-scanning', idSet.has(card.dataset.id));
+  });
+}
+
+function animateScanComplete(run, wasBackground) {
+  const statusEl = document.getElementById('scanStatus');
+  const btnScan = document.getElementById('btnScan');
+
+  const parts = [];
+  if (run?.projects_found > 0) parts.push(`${run.projects_found} projects`);
+  if (run?.summaries_generated > 0) parts.push(`${run.summaries_generated} summaries`);
+  if (run?.estimated_cost_usd > 0) parts.push(`$${run.estimated_cost_usd.toFixed(4)}`);
+  const text = parts.length ? parts.join(' · ') : 'Scan complete';
+
+  if (wasBackground) {
+    showScanDone(run);
+    return;
+  }
+
+  // Animate result text: slides in from right, pauses, slides out left into button area
+  statusEl.style.overflow = 'hidden';
+  statusEl.className = 'scan-status';
+  const inner = document.createElement('span');
+  inner.style.display = 'inline-block';
+  inner.textContent = text;
+  statusEl.innerHTML = '';
+  statusEl.appendChild(inner);
+
+  inner.animate([
+    { transform: 'translateX(110%)', opacity: 0 },
+    { transform: 'translateX(0)',    opacity: 1, offset: 0.2 },
+    { transform: 'translateX(0)',    opacity: 1, offset: 0.72 },
+    { transform: 'translateX(110%)', opacity: 0 },
+  ], { duration: 2200, easing: 'ease-in-out', fill: 'forwards' })
+    .finished.then(() => {
+      statusEl.style.overflow = '';
+      showScanDone(run);
+      setScanUIState(false);
+      btnScan.animate([
+        { transform: 'scale(0.75)', opacity: 0 },
+        { transform: 'scale(1)',    opacity: 1 },
+      ], { duration: 220, easing: 'ease-out' });
+    });
 }
 
 function startPolling() {
   if (scanPollTimer) return;
   const el = document.getElementById('scanStatus');
+  let wasBackground = false;
   scanPollTimer = setInterval(async () => {
     const s = await fetchScanStatus();
+    updateScanningCards(s.progress?.activeProjectIds);
+    if (s.inProgress) wasBackground = !!s.isBackground;
     if (!s.inProgress) {
       clearInterval(scanPollTimer);
       scanPollTimer = null;
+      updateScanningCards([]);
       await reload();
-      showScanDone(s.lastRun);
-      setScanUIState(false);
+      animateScanComplete(s.lastRun, wasBackground);
     } else {
-      el.textContent = formatProgress(s.progress);
+      el.textContent = s.isBackground ? `Background: ${formatProgress(s.progress)}` : formatProgress(s.progress);
       el.className = 'scan-status scanning';
-      setScanUIState(true);
+      if (!s.isBackground) setScanUIState(true);
     }
   }, 1000);
 }
 
+// Slow background poll — keeps card scanning indicators current even without a manual scan
+let bgPollTimer = null;
+function startBgPoll() {
+  if (bgPollTimer) return;
+  bgPollTimer = setInterval(async () => {
+    if (scanPollTimer) return; // fast poll already running
+    const s = await fetchScanStatus();
+    updateScanningCards(s.progress?.activeProjectIds);
+    if (s.inProgress) {
+      el_scanStatus_textContent_bg(s);
+      startPolling(); // hand off to fast poll
+    }
+  }, 5000);
+}
+
+function el_scanStatus_textContent_bg(s) {
+  const el = document.getElementById('scanStatus');
+  el.textContent = s.isBackground ? `Background: ${formatProgress(s.progress)}` : formatProgress(s.progress);
+  el.className = 'scan-status scanning';
+}
+
 async function updateScanStatus() {
   const status = await fetchScanStatus();
+  updateScanningCards(status.progress?.activeProjectIds);
 
   if (status.inProgress) {
-    document.getElementById('scanStatus').textContent = formatProgress(status.progress);
-    document.getElementById('scanStatus').className = 'scan-status scanning';
-    setScanUIState(true);
+    const el = document.getElementById('scanStatus');
+    el.textContent = status.isBackground ? `Background: ${formatProgress(status.progress)}` : formatProgress(status.progress);
+    el.className = 'scan-status scanning';
+    if (!status.isBackground) setScanUIState(true);
     startPolling();
   } else {
     showScanDone(status.lastRun);
@@ -498,13 +864,14 @@ function formatCost(run) {
   return ` · ${run.summaries_generated} summaries · $${cost} · ${(run.input_tokens || 0).toLocaleString()}/${(run.output_tokens || 0).toLocaleString()} tokens`;
 }
 
-function showScanDone(lastRun) {
+function showScanDone(run) {
+  lastScanRun = run;
   const el = document.getElementById('scanStatus');
-  if (lastRun && lastRun.finished_at) {
-    el.textContent = `Last scan: ${formatDate(lastRun.finished_at)}${formatCost(lastRun)}`;
+  if (run && run.finished_at) {
+    el.textContent = `Last scan: ${formatDate(run.finished_at)}${formatCost(run)}`;
     el.className = 'scan-status';
-    el.title = lastRun.estimated_cost_usd
-      ? `Input: ${lastRun.input_tokens} tokens · Output: ${lastRun.output_tokens} tokens · Cost: $${lastRun.estimated_cost_usd.toFixed(6)}`
+    el.title = run.estimated_cost_usd
+      ? `Input: ${run.input_tokens} tokens · Output: ${run.output_tokens} tokens · Cost: $${run.estimated_cost_usd.toFixed(6)}`
       : '';
   } else {
     el.textContent = 'Never scanned';
@@ -525,7 +892,72 @@ async function reload() {
 
 let chatProjectId = null;
 let chatBusy = false;
+let lastScanRun = null;
 const chatHistoryCache = new Map(); // projectId -> innerHTML
+
+function showFreshnessNotice() {
+  const container = document.getElementById('chatMessages');
+
+  const visible = allProjects.filter(p => !p.ignored);
+  const needsSummary = visible.filter(p => !p.summary || summaryOutdated(p));
+  const msSinceScan = lastScanRun?.finished_at ? Date.now() - lastScanRun.finished_at : null;
+  const daysSinceScan = msSinceScan !== null ? Math.floor(msSinceScan / 86400000) : null;
+  const neverScanned = lastScanRun == null;
+
+  // Don't nag if a scan just ran within the last 24 hours
+  if (msSinceScan !== null && msSinceScan < 86400000) return;
+
+  const issues = [];
+  if (neverScanned) issues.push('Projects have never been scanned.');
+  else if (daysSinceScan > 7) issues.push(`Last scan was ${daysSinceScan} days ago.`);
+  if (needsSummary.length > 0) issues.push(`${needsSummary.length} of ${visible.length} projects have no AI summary, or an outdated one.`);
+
+  if (issues.length === 0) return;
+
+  const notice = document.createElement('div');
+  notice.className = 'chat-freshness-notice';
+  notice.innerHTML = `
+    <div class="freshness-text"><strong>Data may be stale.</strong> ${issues.join(' ')}</div>
+    <div class="freshness-actions">
+      <button class="btn btn-primary btn-sm" id="btnFreshnessScan">${neverScanned ? 'Run Quick Scan' : 'Review & Deep Scan'}</button>
+      <button class="freshness-dismiss" id="btnFreshnessDismiss">&times;</button>
+    </div>
+  `;
+  container.appendChild(notice);
+
+  document.getElementById('btnFreshnessScan').onclick = () => {
+    notice.remove();
+    if (neverScanned) {
+      setScanUIState(true);
+      document.getElementById('scanStatus').textContent = 'Starting quick scan...';
+      document.getElementById('scanStatus').className = 'scan-status scanning';
+      triggerScan().then(() => startPolling());
+    } else {
+      openBucketDeepScanConfirm({ label: 'all projects', projects: needsSummary });
+    }
+  };
+  document.getElementById('btnFreshnessDismiss').onclick = () => notice.remove();
+}
+
+function openGlobalChat() {
+  const container = document.getElementById('chatMessages');
+
+  if (chatProjectId && chatProjectId !== 'global') {
+    chatHistoryCache.set(chatProjectId, container.innerHTML);
+  }
+
+  chatProjectId = 'global';
+  document.getElementById('chatTitle').textContent = `Ask AI — ${allProjects.filter(p => !p.ignored).length} projects`;
+
+  container.innerHTML = chatHistoryCache.get('global') || '';
+  container.querySelector('.chat-freshness-notice')?.remove();
+
+  document.getElementById('chatPanel').style.display = 'flex';
+  document.getElementById('chatInput').placeholder = 'Ask anything about your projects...';
+  showFreshnessNotice();
+  document.getElementById('chatInput').focus();
+  container.scrollTop = container.scrollHeight;
+}
 
 function openChat(project) {
   const container = document.getElementById('chatMessages');
@@ -542,6 +974,7 @@ function openChat(project) {
   container.innerHTML = chatHistoryCache.get(project.id) || '';
 
   document.getElementById('chatPanel').style.display = 'flex';
+  document.getElementById('chatInput').placeholder = 'Ask about this project...';
   document.getElementById('chatInput').focus();
   container.scrollTop = container.scrollHeight;
 }
@@ -753,6 +1186,10 @@ async function init() {
   await updateScanStatus();
   initChatResize();
 
+  // Sticky controls — position just below header
+  const header = document.querySelector('header');
+  document.querySelector('.controls').style.top = header.offsetHeight + 'px';
+
   document.getElementById('searchInput').addEventListener('input', applyFilters);
   document.getElementById('filterType').addEventListener('change', applyFilters);
   document.getElementById('filterGroup').addEventListener('change', applyFilters);
@@ -761,18 +1198,11 @@ async function init() {
     await reload();
   });
 
-  document.getElementById('btnQuickScan').addEventListener('click', () => {
+  document.getElementById('btnScan').addEventListener('click', () => {
     setScanUIState(true);
     document.getElementById('scanStatus').textContent = 'Starting quick scan...';
     document.getElementById('scanStatus').className = 'scan-status scanning';
-    triggerScan('quick').then(() => startPolling());
-  });
-
-  document.getElementById('btnDeepScan').addEventListener('click', () => {
-    setScanUIState(true);
-    document.getElementById('scanStatus').textContent = 'Starting deep scan...';
-    document.getElementById('scanStatus').className = 'scan-status scanning';
-    triggerScan('deep').then(() => startPolling());
+    triggerScan().then(() => startPolling());
   });
 
   document.getElementById('btnStopScan').addEventListener('click', () => {
@@ -781,6 +1211,9 @@ async function init() {
     stopScan();
   });
 
+  startBgPoll();
+  document.getElementById('btnGlobalChat').addEventListener('click', openGlobalChat);
+  document.getElementById('btnSettings').addEventListener('click', openSettings);
   document.getElementById('btnChatSend').addEventListener('click', sendChatMessage);
   document.getElementById('chatInput').addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChatMessage(); }

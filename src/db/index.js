@@ -63,6 +63,12 @@ function migrate(db) {
   addColumn('projects', 'has_readme', 'INTEGER DEFAULT 0');
   addColumn('projects', 'has_claude_md', 'INTEGER DEFAULT 0');
   addColumn('projects', 'has_git', 'INTEGER DEFAULT 0');
+  addColumn('projects', 'stale_deps', 'TEXT');
+  addColumn('projects', 'deps_checked_at', 'INTEGER');
+  addColumn('projects', 'deps_commit_hash', 'TEXT');
+  addColumn('projects', 'status', 'TEXT');
+  addColumn('projects', 'commit_hash', 'TEXT');
+  addColumn('projects', 'deep_scan_ignored', 'INTEGER DEFAULT 0');
   addColumn('scan_runs', 'summaries_generated', 'INTEGER DEFAULT 0');
   addColumn('scan_runs', 'input_tokens', 'INTEGER DEFAULT 0');
   addColumn('scan_runs', 'output_tokens', 'INTEGER DEFAULT 0');
@@ -76,12 +82,12 @@ function upsertProject(p) {
       id, name, path, group_name, root_label, type, languages,
       last_commit_date, last_commit_message, last_commit_author,
       commit_count_30d, has_uncommitted, has_readme, has_claude_md, has_git,
-      branch, integrations, first_seen_at, last_scanned_at
+      branch, integrations, status, commit_hash, first_seen_at, last_scanned_at
     ) VALUES (
       @id, @name, @path, @group_name, @root_label, @type, @languages,
       @last_commit_date, @last_commit_message, @last_commit_author,
       @commit_count_30d, @has_uncommitted, @has_readme, @has_claude_md, @has_git,
-      @branch, @integrations, @first_seen_at, @last_scanned_at
+      @branch, @integrations, @status, @commit_hash, @first_seen_at, @last_scanned_at
     )
     ON CONFLICT(path) DO UPDATE SET
       name = excluded.name,
@@ -99,6 +105,8 @@ function upsertProject(p) {
       has_git = excluded.has_git,
       branch = excluded.branch,
       integrations = excluded.integrations,
+      status = excluded.status,
+      commit_hash = excluded.commit_hash,
       last_scanned_at = excluded.last_scanned_at
   `);
   stmt.run(p);
@@ -125,6 +133,10 @@ function setIgnored(id, ignored) {
   getDb().prepare('UPDATE projects SET ignored = ? WHERE id = ?').run(ignored ? 1 : 0, id);
 }
 
+function setDeepScanIgnored(id, ignored) {
+  getDb().prepare('UPDATE projects SET deep_scan_ignored = ? WHERE id = ?').run(ignored ? 1 : 0, id);
+}
+
 function setUserLabel(id, label) {
   getDb().prepare('UPDATE projects SET user_label = ? WHERE id = ?').run(label, id);
 }
@@ -145,11 +157,26 @@ function finishScanRun(runId, found, updated, tokenUsage = {}) {
   ).run(Date.now(), found, updated, summariesGenerated, inputTokens, outputTokens, estimatedCost, runId);
 }
 
+function updateDeps(projectId, staleDeps, commitHash) {
+  getDb().prepare(
+    'UPDATE projects SET stale_deps = ?, deps_checked_at = ?, deps_commit_hash = ? WHERE id = ?'
+  ).run(JSON.stringify(staleDeps), Date.now(), commitHash, projectId);
+}
+
 function getRecentScanRun() {
-  return getDb().prepare('SELECT * FROM scan_runs ORDER BY started_at DESC LIMIT 1').get();
+  return getDb().prepare('SELECT * FROM scan_runs WHERE finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1').get();
+}
+
+function getAverageSummaryCost() {
+  const row = getDb().prepare(
+    `SELECT AVG(estimated_cost_usd * 1.0 / summaries_generated) AS avg
+     FROM scan_runs WHERE summaries_generated > 0`
+  ).get();
+  return row && row.avg != null ? row.avg : null;
 }
 
 module.exports = {
-  getDb, upsertProject, updateSummary, getProjects, getProject,
-  setIgnored, setUserLabel, startScanRun, finishScanRun, getRecentScanRun
+  getDb, upsertProject, updateSummary, updateDeps, getProjects, getProject,
+  setIgnored, setDeepScanIgnored, setUserLabel, startScanRun, finishScanRun,
+  getRecentScanRun, getAverageSummaryCost
 };

@@ -10,7 +10,11 @@ function getClient() {
 }
 
 function buildPrompt(project, transient) {
-  const { readme, claudeMd, recentCommits } = transient;
+  // Docs live under transient.context (analyzer nests them there); recentCommits
+  // is top-level. Reading them off transient directly left readme/claudeMd
+  // undefined, so the AI never actually saw the project docs.
+  const { context = {}, recentCommits = [] } = transient;
+  const { readme, claudeMd } = context;
   const languages = JSON.parse(project.languages || '[]').join(', ');
   const integrations = JSON.parse(project.integrations || '[]').join(', ') || 'none';
   const commits = recentCommits.length > 0
@@ -23,20 +27,13 @@ Project: ${project.name}
 Type: ${project.type}
 Languages: ${languages}
 Integrations: ${integrations}
-Branch: ${project.branch || 'unknown'}
-Commits in last 30 days: ${project.commit_count_30d || 0}
-Has uncommitted changes: ${project.has_uncommitted ? 'yes' : 'no'}
 
 ${readme ? `README:\n${readme}\n` : ''}
 ${claudeMd ? `CLAUDE.md:\n${claudeMd}\n` : ''}
 Recent commits:
 ${commits}
 
-Write a concise project summary in 2-3 sentences. Do NOT use headings, titles, or labels like "Project Summary:". Just write the summary directly as plain text.
-
-Then on a new line starting with "STATUS:", write one of: Active, Stale, Abandoned, Early Stage — and a brief reason (one sentence).
-
-Keep the whole response under 120 words. Be specific about what the project does, not generic. No markdown headings.`;
+Write a concise project summary in 2-3 sentences (under 80 words). Be specific about what the project does, not generic. Just the summary as plain text — no headings, titles, labels, or markdown.`;
 }
 
 async function summarize(project, transient) {
@@ -62,13 +59,17 @@ async function summarize(project, transient) {
   }
 }
 
-function needsSummaryRefresh(dbProject, currentCommitHash) {
+function needsSummaryRefresh(dbProject, currentCommitHash, force = false) {
+  // Manual scans (user-requested) always regenerate.
+  if (force) return true;
+  // Never summarized yet — must generate once.
   if (!dbProject || !dbProject.summary) return true;
-  if (!dbProject.summary_commit_hash) return true;
-  if (currentCommitHash && currentCommitHash !== dbProject.summary_commit_hash) return true;
-  const sevenDays = 7 * 24 * 60 * 60 * 1000;
-  if (!dbProject.summary_generated_at || Date.now() - dbProject.summary_generated_at > sevenDays) return true;
-  return false;
+  // No commit hash (no git, or git with no commits): there's no version signal
+  // to detect modification, so don't auto-regenerate — only a manual scan will.
+  if (!currentCommitHash) return false;
+  // Otherwise regenerate only when the project actually changed (new commit).
+  // No time-based staleness: unmodified projects keep their summary indefinitely.
+  return currentCommitHash !== dbProject.summary_commit_hash;
 }
 
 module.exports = { summarize, needsSummaryRefresh };
