@@ -8,13 +8,21 @@ Sauron is a local dashboard that scans your development directories, tracks ever
 
 Projects are organized into temporal buckets (last 7 days, 14 days, 30 days, etc.) with color-coded sections. Each card shows the project type, uncommitted status, detected integrations, AI summary, and last commit info.
 
+![Search & Filter](assets/screenshots/search.jpeg)
+
+Search and filter by name, type, group, or uncommitted status to narrow the fleet down to exactly what you're looking for.
+
 ![Project Detail](assets/screenshots/project-detail.jpeg)
 
 Click any project to see full details including git metadata, detected integrations, documentation status, and an AI-generated summary. From here you can trigger a rescan or open an AI chat session scoped to that project.
 
-![AI Chat](assets/screenshots/ai-chat.jpeg)
+![Global AI Chat](assets/screenshots/global-ai-chat.jpeg)
 
-The per-project AI chat can browse files, search code, run read-only git commands, and answer questions about the project. It uses Claude's tool-use to explore the codebase on demand.
+The global **Ask AI** chat answers questions across your whole fleet at once — e.g. which projects use a given integration, or haven't been touched in a while — from project metadata only.
+
+![Project AI Chat](assets/screenshots/ai-chat.jpeg)
+
+The per-project AI chat can browse files, search code, run read-only git commands, and answer questions about that specific project. It uses Claude's tool-use to explore the codebase on demand.
 
 ---
 
@@ -41,7 +49,7 @@ Run it:
 npm start
 ```
 
-Open `http://127.0.0.1:7777` (or whatever `HOST:PORT` you set). Click **Quick Scan** to discover projects and gather metadata, then **Deep Scan** to regenerate all AI summaries.
+Open `http://127.0.0.1:7777` (or whatever `HOST:PORT` you set). Click **Quick Scan** to discover projects and gather metadata — free, no AI calls. To generate AI summaries, expand a project's time-bucket group or open an individual project and click **Deep Scan** — you'll see a real cost estimate before anything runs.
 
 ---
 
@@ -53,10 +61,12 @@ Sauron recursively walks the directories listed in `SCAN_ROOTS`. A directory is 
 
 Two scan modes:
 
-- **Quick Scan** -- Full directory crawl, collects git metadata (last commit, branch, uncommitted changes, 30-day commit count), detects project type, languages, integrations. No AI calls. Fast and free.
-- **Deep Scan** -- Everything Quick Scan does, plus sends project context (README, CLAUDE.md, recent git log) to Claude for a 2-3 sentence summary and status classification (Active, Stale, Abandoned, Early Stage). Summaries are cached and only regenerated when new commits are detected.
+- **Quick Scan** -- Full directory crawl, collects git metadata (last commit, branch, uncommitted changes, 30-day commit count), detects project type, languages, integrations, and checks for outdated dependencies. No AI calls. Free, and always available for the whole fleet or a scoped selection.
+- **Deep Scan** -- Everything Quick Scan does, plus sends project context (README, CLAUDE.md, recent git log) to Claude for a 2-3 sentence summary. Summaries are cached by commit hash and only regenerated when a project actually changes.
 
-Scans can also be triggered per temporal bucket or per individual project from the UI.
+Deep Scan always requires an explicit selection — there's no single button that summarizes everything. Trigger it per temporal bucket (review a checklist of that group's projects, deselect any you don't want, see a real cost estimate, then confirm) or per individual project (a lighter one-click confirm that always regenerates that project's summary). A project can also be marked to skip AI summaries entirely via **Skip AI summaries** in its detail view — it still gets Quick Scan metadata, just never an AI call.
+
+Activity status (Active / Stale / Abandoned) is computed deterministically from git history, not by the AI. If a project's commit changes after its summary was generated, its card shows an **Outdated** badge until it's re-summarized.
 
 ### Project Detection
 
@@ -78,7 +88,7 @@ Sauron checks `package.json` dependencies and `pyproject.toml` contents for know
 
 ### AI Chat
 
-Each project gets a scoped chat session powered by Claude. The AI has access to read-only tools:
+There are two chat modes. The **global chat** ("Ask AI" in the header) answers project-discovery questions across your whole fleet at once — e.g. "which projects use Stripe" — from project metadata only, with no file access. Each **individual project** also gets its own scoped chat session with real tool access:
 
 - **list_directory** -- Browse the file tree
 - **read_file** -- Read file contents (with offset/limit for large files)
@@ -102,20 +112,17 @@ All configuration lives in `.env`. Copy `.env.example` to get started.
 | `HOST` | Server bind address | `127.0.0.1` |
 | `PORT` | Server port | `7777` |
 | `ACTIVE_CUTOFF_DAYS` | How far back to look for "active" projects | `30` |
-| `QUICK_SCAN_TOP_N` | Max projects in a targeted quick scan | `20` |
-| `MAX_SUMMARIES_PER_SCAN` | Max AI summaries per deep scan (recent projects first) | `50` |
+| `MAX_SUMMARIES_PER_SCAN` | Max projects in a single Deep Scan selection | `50` |
 | `IGNORE_PATHS` | Comma-separated directory paths to skip | -- |
-| `SCHEDULE_ENABLED` | Enable automatic scanning | `false` |
-| `SCHEDULE_QUICK_CRON` | Cron for automatic quick scans (metadata only) | `*/30 * * * *` (every 30 min) |
-| `SCHEDULE_DEEP_CRON` | Cron for automatic deep scans (metadata + AI summaries) | `0 18 * * *` (6pm daily) |
+| `PRICE_INPUT_MTOK` / `PRICE_OUTPUT_MTOK` | Per-million-token pricing for `CLAUDE_MODEL`, used to compute the in-app cost meter | `0.80` / `4.00` (Haiku) |
 
 ### Cost
 
-All AI calls use the model specified in `CLAUDE_MODEL` (defaults to Haiku). Costs are tracked per scan and displayed in the UI header.
+All AI calls use the model specified in `CLAUDE_MODEL` (defaults to Haiku). Costs are tracked per scan and displayed in the UI header, and every Deep Scan confirmation shows a real estimate — computed from your actual scan history — before it runs.
 
 Typical costs:
-- Quick Scan: **$0.00** (no AI calls)
-- Deep Scan (50 summaries): **~$0.05-0.10**
+- Quick Scan: **$0.00** (no AI calls, any scope)
+- Deep Scan: **~$0.0005-0.001 per summary** — flat per project, since the prompt is bounded (README/CLAUDE.md excerpts + recent commits, not full repo contents) rather than proportional to repo size. A single Deep Scan selection is capped at `MAX_SUMMARIES_PER_SCAN` (default 50).
 - Chat message: **~$0.001-0.005** per turn
 
 ### Tech Stack
@@ -123,7 +130,6 @@ Typical costs:
 - **Backend**: Node.js, Express, better-sqlite3
 - **Frontend**: Vanilla HTML/CSS/JS (no framework)
 - **AI**: Anthropic Claude API (streaming, tool use)
-- **Scheduling**: node-cron
 
 ### Data
 
