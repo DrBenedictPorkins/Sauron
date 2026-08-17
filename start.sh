@@ -20,4 +20,11 @@ else
     done
 fi
 
-open -a Firefox "$URL"
+CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+PROFILE_DIR="$HOME/.sauron-chrome"
+
+"$CHROME" \
+    --user-data-dir="$PROFILE_DIR" \
+    --no-first-run \
+    --no-default-browser-check \
+    --app="$URL" > /dev/null 2>&1 &

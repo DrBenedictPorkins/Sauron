@@ -11,6 +11,22 @@ npm run dev        # Run with nodemon (auto-restart on changes)
 
 No test framework, linter, or build step is configured. The app is plain Node.js (no transpilation).
 
+## Launcher
+
+`~/Applications/Sauron.app` is an AppleScript applet whose only action is:
+
+```
+do shell script "/Users/makram/dev/sauron/start.sh > /tmp/sauron-launch.log 2>&1"
+```
+
+`start.sh` starts the server if port 7777 isn't already listening (logs to `/tmp/sauron.log`), waits for it, then opens the dashboard in a **dedicated Chrome instance** — its own profile at `~/.sauron-chrome`, launched with `--app=` so it's a chromeless window, not a tab in the user's normal browser. Chrome, not Firefox.
+
+To kill the server, target the listener only:
+
+```bash
+lsof -nP -iTCP:7777 -sTCP:LISTEN | awk 'NR>1 {print $2}' | xargs kill
+```
+
 ## Configuration
 
 All config lives in `.env` (copy `.env.example` to start). Key variables:
