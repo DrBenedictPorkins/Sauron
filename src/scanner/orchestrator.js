@@ -45,7 +45,8 @@ async function runScan(cfg, type = 'quick', { projectIds, forceRegenerate = fals
     stopRequested: false,
   };
 
-  const runId = db.startScanRun(type);
+  const scoped = !!(projectIds && projectIds.length > 0);
+  const runId = db.startScanRun(type, scoped ? 'scoped' : 'fleet');
 
   try {
     // Phase 1: discover

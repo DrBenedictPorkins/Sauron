@@ -79,6 +79,21 @@ function createApp() {
     runScan(config.load(), type, { projectIds, forceRegenerate }).catch(console.error);
   });
 
+  // Everything the Quick Scan confirmation needs to answer "do I even need to
+  // run this?" — when the last full-fleet Quick Scan finished, what it found,
+  // how long one usually takes, and which directories are about to be walked.
+  app.get('/api/scan/quick-preview', (_req, res) => {
+    const cfg = config.load();
+    res.json({
+      scanRoots: cfg.scanRoots,
+      ignore: cfg.ignore,
+      projectsTracked: db.countProjects(),
+      lastFleetQuickScan: db.getLastFleetQuickScan() || null,
+      lastAnyScan: db.getRecentScanRun() || null,
+      avgDurationMs: db.getAverageQuickScanDuration(),
+    });
+  });
+
   app.get('/api/scan/cost-estimate', (_req, res) => {
     res.json({ avgCostPerSummary: db.getAverageSummaryCost() });
   });

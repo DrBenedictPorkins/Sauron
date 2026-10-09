@@ -796,6 +796,37 @@ h1 {
   padding: 1px 8px;
 }
 
+/* Quick Scan confirmation — freshness banner */
+.scan-freshness {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 4px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.scan-freshness.is-fresh {
+  border-color: var(--success);
+  background: rgba(39, 174, 96, 0.1);
+}
+
+.scan-freshness-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.scan-freshness.is-fresh .scan-freshness-hint { color: var(--success); }
+
+.scan-confirm-note-line {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 8px;
+  line-height: 1.5;
+}
+
 .scan-confirm-summary {
   font-size: 12px;
   color: var(--text-muted);

@@ -69,6 +69,7 @@ function migrate(db) {
   addColumn('projects', 'status', 'TEXT');
   addColumn('projects', 'commit_hash', 'TEXT');
   addColumn('projects', 'deep_scan_ignored', 'INTEGER DEFAULT 0');
+  addColumn('scan_runs', 'scope', 'TEXT');
   addColumn('scan_runs', 'summaries_generated', 'INTEGER DEFAULT 0');
   addColumn('scan_runs', 'input_tokens', 'INTEGER DEFAULT 0');
   addColumn('scan_runs', 'output_tokens', 'INTEGER DEFAULT 0');
@@ -141,10 +142,14 @@ function setUserLabel(id, label) {
   getDb().prepare('UPDATE projects SET user_label = ? WHERE id = ?').run(label, id);
 }
 
-function startScanRun(type) {
+// scope: 'fleet' (full crawl of SCAN_ROOTS) or 'scoped' (an explicit project
+// selection). Rows written before this column existed have scope NULL, which is
+// deliberately not treated as 'fleet' — the freshness hints below would rather
+// say "no record" than assert a scope that was never stored.
+function startScanRun(type, scope = 'fleet') {
   const result = getDb().prepare(
-    'INSERT INTO scan_runs (type, started_at) VALUES (?, ?)'
-  ).run(type, Date.now());
+    'INSERT INTO scan_runs (type, scope, started_at) VALUES (?, ?, ?)'
+  ).run(type, scope, Date.now());
   return result.lastInsertRowid;
 }
 
@@ -167,6 +172,27 @@ function getRecentScanRun() {
   return getDb().prepare('SELECT * FROM scan_runs WHERE finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1').get();
 }
 
+function getLastFleetQuickScan() {
+  return getDb().prepare(
+    `SELECT * FROM scan_runs
+     WHERE type = 'quick' AND scope = 'fleet' AND finished_at IS NOT NULL
+     ORDER BY finished_at DESC LIMIT 1`
+  ).get();
+}
+
+function getAverageQuickScanDuration() {
+  const row = getDb().prepare(
+    `SELECT AVG(finished_at - started_at) AS avg FROM scan_runs
+     WHERE type = 'quick' AND scope = 'fleet' AND finished_at IS NOT NULL`
+  ).get();
+  return row && row.avg != null ? Math.round(row.avg) : null;
+}
+
+function countProjects({ includeIgnored = false } = {}) {
+  const where = includeIgnored ? '' : 'WHERE ignored = 0';
+  return getDb().prepare(`SELECT COUNT(*) AS n FROM projects ${where}`).get().n;
+}
+
 function getAverageSummaryCost() {
   const row = getDb().prepare(
     `SELECT AVG(estimated_cost_usd * 1.0 / summaries_generated) AS avg
@@ -178,5 +204,6 @@ function getAverageSummaryCost() {
 module.exports = {
   getDb, upsertProject, updateSummary, updateDeps, getProjects, getProject,
   setIgnored, setDeepScanIgnored, setUserLabel, startScanRun, finishScanRun,
-  getRecentScanRun, getAverageSummaryCost
+  getRecentScanRun, getAverageSummaryCost, getLastFleetQuickScan,
+  getAverageQuickScanDuration, countProjects
 };

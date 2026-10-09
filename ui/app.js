@@ -74,6 +74,11 @@ async function fetchCostEstimate() {
   return res.json();
 }
 
+async function fetchQuickScanPreview() {
+  const res = await fetch('/api/scan/quick-preview');
+  return res.json();
+}
+
 async function ignoreProject(id, ignored) {
   await fetch(`/api/projects/${id}/ignore`, {
     method: 'POST',
@@ -422,29 +427,6 @@ function openModal(p) {
 
   modal.style.display = 'flex';
 
-  // On-demand: dormant projects are skipped by auto-scans to save tokens, so if
-  // there's no cached summary, generate one lazily the first time it's opened.
-  if (!p.summary) {
-    const summaryEl = document.getElementById('modalSummary');
-    summaryEl.innerHTML = '<span style="color:var(--accent);font-style:italic">Generating summary…</span>';
-    fetch(`/api/projects/${p.id}/summarize`, { method: 'POST' })
-      .then(r => r.json())
-      .then(async (data) => {
-        const el = document.getElementById('modalSummary');
-        if (!el) return; // modal closed or switched projects
-        if (data.summary) {
-          el.innerHTML = renderMarkdown(esc(getSummaryText(data.summary)));
-          await reload();
-        } else {
-          el.innerHTML = '<span style="color:var(--text-muted);font-style:italic">Could not generate summary.</span>';
-        }
-      })
-      .catch(() => {
-        const el = document.getElementById('modalSummary');
-        if (el) el.innerHTML = '<span style="color:var(--text-muted);font-style:italic">Could not generate summary.</span>';
-      });
-  }
-
   document.getElementById('modalClose').onclick = closeModal;
   document.getElementById('modalBackdrop').onclick = closeModal;
 
@@ -532,6 +514,135 @@ function closeModal() {
 
 function closeScanConfirm() {
   document.getElementById('scanConfirmModal').style.display = 'none';
+}
+
+// formatDate() collapses anything under a day to "today", which is exactly the
+// resolution that matters when deciding whether a rescan is worth it.
+function formatAgoPrecise(ts) {
+  const diff = Date.now() - ts;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} minute${mins !== 1 ? 's' : ''} ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} hour${hours !== 1 ? 's' : ''} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days !== 1 ? 's' : ''} ago`;
+}
+
+function formatDuration(ms) {
+  if (ms == null) return null;
+  const secs = Math.round(ms / 1000);
+  if (secs < 60) return `${secs}s`;
+  return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+}
+
+// Below this, a rescan is very unlikely to surface anything new — the popup says
+// so plainly instead of silently letting the user re-walk the whole tree.
+const QUICK_SCAN_FRESH_MS = 6 * 3600000;
+
+// Fleet-wide Quick Scan confirmation. Free (no AI calls), but it re-walks every
+// scan root and can re-run dependency checks, so the popup answers "is this
+// even needed?" before it starts.
+async function openQuickScanConfirm() {
+  const modal = document.getElementById('scanConfirmModal');
+  const content = document.getElementById('scanConfirmContent');
+
+  let preview;
+  try {
+    preview = await fetchQuickScanPreview();
+  } catch {
+    preview = null;
+  }
+
+  const last = preview?.lastFleetQuickScan;
+  const fresh = last?.finished_at && (Date.now() - last.finished_at) < QUICK_SCAN_FRESH_MS;
+
+  let freshnessHtml;
+  if (last?.finished_at) {
+    const bits = [`found ${last.projects_found} project${last.projects_found !== 1 ? 's' : ''}`];
+    const took = formatDuration(last.finished_at - last.started_at);
+    if (took) bits.push(`took ${took}`);
+    freshnessHtml = `
+      <div class="scan-freshness ${fresh ? 'is-fresh' : ''}">
+        <div><strong>Last full Quick Scan: ${formatAgoPrecise(last.finished_at)}</strong> — ${bits.join(', ')}.</div>
+        ${fresh ? '<div class="scan-freshness-hint">Nothing has likely changed since — you can probably skip this.</div>' : ''}
+      </div>`;
+  } else if (preview?.lastAnyScan?.finished_at) {
+    freshnessHtml = `
+      <div class="scan-freshness">
+        <div><strong>No full Quick Scan on record.</strong></div>
+        <div class="scan-freshness-hint">Last scan of any kind was ${formatAgoPrecise(preview.lastAnyScan.finished_at)}. Full-fleet runs have only been tracked separately since this version.</div>
+      </div>`;
+  } else {
+    freshnessHtml = `
+      <div class="scan-freshness">
+        <div><strong>Never scanned.</strong></div>
+        <div class="scan-freshness-hint">This is the first run — it will build the project list from scratch.</div>
+      </div>`;
+  }
+
+  const roots = preview?.scanRoots || [];
+  const rootsHtml = roots.length
+    ? roots.map(r => `<div class="settings-kv"><span class="settings-key">${esc(r.label)}</span><span class="settings-val">${esc(r.path)}</span></div>`).join('')
+    : '<div class="settings-empty">No scan roots configured — set SCAN_ROOTS in .env.</div>';
+
+  const ignore = preview?.ignore || [];
+  const avgDuration = formatDuration(preview?.avgDurationMs);
+
+  content.innerHTML = `
+    <button class="modal-close" id="scanConfirmClose">&times;</button>
+    <div class="modal-title">Quick Scan — full fleet</div>
+    ${freshnessHtml}
+
+    <div class="modal-section">
+      <div class="modal-section-label">Directories to scan</div>
+      <div class="modal-section-body">${rootsHtml}</div>
+    </div>
+
+    ${ignore.length ? `
+    <div class="modal-section">
+      <div class="modal-section-label">Ignored</div>
+      <div class="modal-section-body">${ignore.map(p => `<div class="settings-val">${esc(p)}</div>`).join('')}</div>
+    </div>` : ''}
+
+    <div class="modal-section">
+      <div class="modal-section-label">What it does</div>
+      <div class="modal-section-body">
+        <div class="settings-kv"><span class="settings-key">Cost</span><span class="settings-val">$0.00 — no AI calls</span></div>
+        <div class="settings-kv"><span class="settings-key">Currently tracked</span><span class="settings-val">${preview?.projectsTracked ?? '—'} projects</span></div>
+        <div class="settings-kv"><span class="settings-key">Typical duration</span><span class="settings-val">${avgDuration ? `~${avgDuration}` : 'no timing history yet'}</span></div>
+        <div class="scan-confirm-note-line">Re-walks the scan roots, refreshes git metadata, and re-checks dependencies for projects whose commit changed.</div>
+      </div>
+    </div>
+
+    <div class="scan-confirm-summary">Summaries are untouched — only a Deep Scan spends anything.</div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="scanConfirmCancel">Cancel</button>
+      <button class="btn ${fresh ? 'btn-secondary' : 'btn-primary'}" id="scanConfirmGo" style="margin-left:auto">${fresh ? 'Scan anyway' : 'Run Quick Scan'}</button>
+    </div>
+  `;
+  modal.style.display = 'flex';
+
+  document.getElementById('scanConfirmClose').onclick = closeScanConfirm;
+  document.getElementById('scanConfirmCancel').onclick = closeScanConfirm;
+  document.getElementById('scanConfirmBackdrop').onclick = closeScanConfirm;
+
+  const goBtn = document.getElementById('scanConfirmGo');
+  goBtn.onclick = () => {
+    goBtn.disabled = true;
+    goBtn.textContent = 'Starting...';
+    triggerScan().then(() => {
+      closeScanConfirm();
+      setScanUIState(true);
+      document.getElementById('scanStatus').textContent = 'Starting quick scan...';
+      document.getElementById('scanStatus').className = 'scan-status scanning';
+      startPolling();
+    }).catch(err => {
+      document.querySelector('#scanConfirmContent .scan-confirm-summary').textContent = err.message;
+      goBtn.disabled = false;
+      goBtn.textContent = 'Run Quick Scan';
+    });
+  };
 }
 
 function formatCostEstimate(avgCostPerSummary, count) {
@@ -1198,12 +1309,7 @@ async function init() {
     await reload();
   });
 
-  document.getElementById('btnScan').addEventListener('click', () => {
-    setScanUIState(true);
-    document.getElementById('scanStatus').textContent = 'Starting quick scan...';
-    document.getElementById('scanStatus').className = 'scan-status scanning';
-    triggerScan().then(() => startPolling());
-  });
+  document.getElementById('btnScan').addEventListener('click', openQuickScanConfirm);
 
   document.getElementById('btnStopScan').addEventListener('click', () => {
     document.getElementById('btnStopScan').disabled = true;
