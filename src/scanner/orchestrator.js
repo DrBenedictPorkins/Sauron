@@ -1,7 +1,9 @@
 const { scanAll } = require('./index');
 const { analyze, checkDeps } = require('../analyzer');
 const { summarize, needsSummaryRefresh } = require('../summarizer');
+const { findLinks, needsLinksRefresh } = require('../links');
 const db = require('../db');
+const { PRICE_PER_INPUT_TOKEN, PRICE_PER_OUTPUT_TOKEN } = require('../models');
 
 let scan = null;
 const activeProjectIds = new Set();
@@ -13,9 +15,12 @@ function getProgress() {
     type: scan.type,
     projectsCurrent: scan.projectsCurrent,
     projectsTotal: scan.projectsTotal,
+    skippedIgnored: scan.skippedIgnored,
     currentProjectName: scan.currentProjectName,
     summariesCurrent: scan.summariesCurrent,
     summariesTotal: scan.summariesTotal,
+    linksCurrent: scan.linksCurrent,
+    linksTotal: scan.linksTotal,
     inputTokens: scan.inputTokens,
     outputTokens: scan.outputTokens,
     estimatedCost: scan.estimatedCost,
@@ -27,7 +32,7 @@ function requestStop() {
   if (scan) scan.stopRequested = true;
 }
 
-async function runScan(cfg, type = 'quick', { projectIds, forceRegenerate = false } = {}) {
+async function runScan(cfg, type = 'quick', { projectIds, forceRegenerate = false, findLinks: wantLinks = false } = {}) {
   if (scan) return { skipped: true, reason: 'Scan already in progress' };
   const deep = type !== 'quick';
 
@@ -36,9 +41,13 @@ async function runScan(cfg, type = 'quick', { projectIds, forceRegenerate = fals
     phase: 'discovering',
     projectsCurrent: 0,
     projectsTotal: 0,
+    skippedIgnored: 0,
     currentProjectName: null,
     summariesCurrent: 0,
     summariesTotal: 0,
+    linksCurrent: 0,
+    linksTotal: 0,
+    linksCost: 0,
     inputTokens: 0,
     outputTokens: 0,
     estimatedCost: 0,
@@ -46,6 +55,7 @@ async function runScan(cfg, type = 'quick', { projectIds, forceRegenerate = fals
   };
 
   const scoped = !!(projectIds && projectIds.length > 0);
+  let skippedIgnored = 0;
   const runId = db.startScanRun(type, scoped ? 'scoped' : 'fleet');
 
   try {
@@ -58,10 +68,20 @@ async function runScan(cfg, type = 'quick', { projectIds, forceRegenerate = fals
         .filter(p => idSet.has(p.id))
         .map(p => ({ path: p.path, name: p.name, group: p.group_name, rootLabel: p.root_label, type: p.type }));
     } else {
-      projectList = scanAll(cfg);
+      // The ignore toggle hides a project from the dashboard, so there is nothing
+      // to gain from analyzing it — and a dependency re-check alone can cost 30s.
+      // Only the fleet path filters: an explicit projectIds selection is the user
+      // asking for those projects by name, ignored or not.
+      const ignoredPaths = new Set(
+        db.getProjects({ includeIgnored: true }).filter(p => p.ignored).map(p => p.path)
+      );
+      const discovered = scanAll(cfg);
+      projectList = discovered.filter(p => !ignoredPaths.has(p.path));
+      skippedIgnored = discovered.length - projectList.length;
     }
 
     scan.projectsTotal = projectList.length;
+    scan.skippedIgnored = skippedIgnored;
     scan.phase = 'analyzing';
 
     // Phase 2: analyze (git metadata, integrations, languages)
@@ -134,14 +154,56 @@ async function runScan(cfg, type = 'quick', { projectIds, forceRegenerate = fals
       activeProjectIds.delete(dbFields.id);
     }
 
+    // Phase 5: cross-project links — Deep Scan only, and only when the user left
+    // "Find links" ticked. AI reads this project; the match against the rest of
+    // the fleet is a local ripgrep, so unscanned projects are still found.
+    let linkCount = 0;
+    let linkFailures = 0;
+    if (deep && wantLinks && !scan.stopRequested) {
+      scan.phase = 'finding links';
+      const toLink = analyzed.filter(({ dbFields, transient }) =>
+        projectIds.includes(dbFields.id) &&
+        needsLinksRefresh(db.getProject(dbFields.id), transient.commitHash, forceRegenerate));
+      scan.linksTotal = toLink.length;
+      const fleet = db.getProjects();
+
+      for (const { dbFields, transient } of toLink) {
+        if (scan.stopRequested) break;
+        scan.linksCurrent++;
+        scan.currentProjectName = dbFields.name;
+        activeProjectIds.add(dbFields.id);
+        try {
+          const result = await findLinks(db.getProject(dbFields.id), fleet);
+          db.saveLinks(dbFields.id, result.facts, transient.commitHash, result.edges);
+          scan.inputTokens += result.inputTokens;
+          scan.outputTokens += result.outputTokens;
+          scan.estimatedCost += result.cost;
+          scan.linksCost += result.cost;
+          linkCount++;
+        } catch (err) {
+          console.error(`Link finding failed for ${dbFields.name}:`, err.message);
+          linkFailures++;
+          const spent = (err.inputTokens || 0) * PRICE_PER_INPUT_TOKEN + (err.outputTokens || 0) * PRICE_PER_OUTPUT_TOKEN;
+          scan.inputTokens += err.inputTokens || 0;
+          scan.outputTokens += err.outputTokens || 0;
+          scan.estimatedCost += spent;
+          scan.linksCost += spent;
+        }
+        activeProjectIds.delete(dbFields.id);
+      }
+    }
+
     activeProjectIds.clear();
     db.finishScanRun(runId, analyzed.length, successCount, {
       inputTokens: scan.inputTokens,
       outputTokens: scan.outputTokens,
       estimatedCost: scan.estimatedCost,
       summariesGenerated: successCount,
+      linksGenerated: linkCount,
+      linksCost: scan.linksCost,
+      linksFailed: linkFailures,
     });
-    return { success: true, found: analyzed.length, summarized: successCount };
+    return { success: true, found: analyzed.length, summarized: successCount, linked: linkCount };
   } catch (err) {
     console.error('Scan error:', err);
     activeProjectIds.clear();

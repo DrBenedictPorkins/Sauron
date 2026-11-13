@@ -32,7 +32,7 @@ lsof -nP -iTCP:7777 -sTCP:LISTEN | awk 'NR>1 {print $2}' | xargs kill
 All config lives in `.env` (copy `.env.example` to start). Key variables:
 - `ANTHROPIC_API_KEY` — required for AI features (summaries, chat)
 - `SCAN_ROOTS` — comma-separated `path:label` pairs (e.g. `~/dev:Dev,~/projects:Projects`)
-- `CLAUDE_MODEL` — model alias for all Anthropic API calls (default: `claude-haiku-4-5`)
+- `CLAUDE_MODEL` — model alias for all Anthropic API calls (default: `claude-haiku-5-5`; Claude 5.x only)
 - `HOST`/`PORT` — server bind address (default: `127.0.0.1:7777`)
 
 ## Architecture
@@ -45,12 +45,14 @@ Sauron is a local project dashboard that scans dev directories, tracks git activ
 - **`config.js`** — Reads `.env` into a config object. Parses `SCAN_ROOTS` and `IGNORE_PATHS`.
 - **`models.js`** — Exports `MODEL` name and per-token pricing constants from env.
 - **`api/index.js`** — Express routes. REST API for projects, scans, chat, and config. Serves `ui/` as static.
-- **`db/index.js`** — SQLite layer. Auto-migrates schema on first access (WAL mode). Two tables: `projects` and `scan_runs`. Uses upsert on project path.
+- **`db/index.js`** — SQLite layer. Auto-migrates schema on first access (WAL mode). Three tables: `projects`, `scan_runs` and `project_links`. Uses upsert on project path.
 - **`scanner/index.js`** — Filesystem crawler. Walks `SCAN_ROOTS` up to depth 4, classifies directories as projects by markers (`.git`, `package.json`, `pyproject.toml`, `*.xcodeproj`). Non-project dirs are treated as grouping folders and recursed into.
-- **`scanner/orchestrator.js`** — Coordinates the scan phases: discover -> analyze -> check deps -> summarize. Manages scan state, progress tracking, and stop requests. Only Deep Scan runs the summarize phase, and Deep Scan always targets an explicit project selection (a recency bucket or a single project) — there's no fleet-wide Deep Scan trigger.
+- **`scanner/orchestrator.js`** — Coordinates the scan phases: discover -> analyze -> check deps -> summarize -> find links (Deep Scan with `findLinks` only). Manages scan state, progress tracking, and stop requests. Only Deep Scan runs the summarize phase, and Deep Scan always targets an explicit project selection (a recency bucket or a single project) — there's no fleet-wide Deep Scan trigger.
 - **`analyzer/index.js`** — Per-project analysis. Gathers git metadata (last commit, 30-day count, branch, uncommitted status), detects project type and languages, finds integrations in `package.json`/`pyproject.toml`, reads README/CLAUDE.md for AI context.
+- **`docgen/index.js`** — One-shot CLAUDE.md / README.md drafting. Runs the same read-only tool loop as the chat, outside any chat session, and writes the result to `$TMPDIR/sauron-drafts/<project-id>/`. Never writes into the project; drafts are deleted when the UI dialog closes.
+- **`links/index.js`** — Cross-project link finding, an optional Deep Scan phase ("Find links", ticked by default in the UI, off by default at the API). AI reads one project with the read-only chat tools (`.env` blocked) and reports identifiers it consumes/provides via a `report_links` tool; a local ripgrep then matches them across every tracked project, so the counterpart is found even if never Deep Scanned. Edges live in `project_links`, written from the scanned side and read from either side (`linksFor`). Route-only matches are dropped; identifiers matching >15 projects are dropped as boilerplate. Requires `rg`.
 - **`summarizer/index.js`** — Calls Claude API to generate 2-3 sentence project summaries with status classification. Tracks token usage and cost.
-- **`chat/index.js`** — Per-project AI chat with tool use. Provides 5 read-only tools (list_directory, read_file, get_file_info, search_files, git_command). Sessions are in-memory Maps keyed by project ID. Supports conversation condensation via AI.
+- **`chat/index.js`** — Per-project AI chat with tool use. Provides 5 read-only tools (list_directory, read_file, get_file_info, search_files, git_command). There is deliberately no write tool: the AI never modifies a project. Sessions are in-memory Maps keyed by project ID. Supports conversation condensation via AI. Global chat gets `search_all_projects` (ripgrep across every tracked, non-ignored project) plus the same five tools with a `project` argument.
 
 ### Frontend (`ui/`)
 
@@ -63,6 +65,11 @@ Single-page app: `index.html`, `style.css`, `app.js`. Communicates with backend 
 3. **Chat**: SSE stream, tool-use loop — Claude calls read-only tools, results fed back until final text response
 
 ### Key design decisions
+
+- Three separate "ignore" concepts, easily confused:
+  - `IGNORE_PATHS` (`.env`) — paths the filesystem crawler never descends into.
+  - `projects.ignored` — the per-project **Ignore** toggle. Hides the project from the dashboard *and* excludes it from fleet scans (orchestrator filters discovered paths against it). An explicit `projectIds` selection still scans it, so a project can be refreshed by name from its own card.
+  - `projects.deep_scan_ignored` — **Skip AI summaries**. Metadata still refreshes; only the summarize phase skips it.
 
 - Project IDs are SHA-1 hashes of the absolute path (first 12 chars)
 - Chat tool execution is sandboxed: paths are resolved and validated to stay within project root; git commands are allowlisted to read-only subcommands

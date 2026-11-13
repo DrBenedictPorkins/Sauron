@@ -42,11 +42,20 @@ async function summarize(project, transient) {
   try {
     const response = await getClient().messages.create({
       model: MODEL,
-      max_tokens: 200,
+      // 600, not 200: thinking tokens count toward max_tokens, and at 200 the
+      // 5.x models truncated 3 of 10 real summaries mid-sentence. Measured
+      // ceiling across those 10 was 291 output tokens.
+      max_tokens: 600,
       messages: [{ role: 'user', content: prompt }],
     });
 
-    const summary = response.content[0].text.trim();
+    // Not content[0]: on models with thinking on by default the first block is a
+    // thinking block, and .text is undefined.
+    const summary = response.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    if (!summary) {
+      console.error(`Summarizer returned no text for ${project.name} (stop_reason: ${response.stop_reason})`);
+      return null;
+    }
     const inputTokens = response.usage.input_tokens;
     const outputTokens = response.usage.output_tokens;
     const cost = inputTokens * PRICE_PER_INPUT_TOKEN + outputTokens * PRICE_PER_OUTPUT_TOKEN;

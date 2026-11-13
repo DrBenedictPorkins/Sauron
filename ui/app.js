@@ -1,5 +1,8 @@
 let allProjects = [];
 let scanPollTimer = null;
+// Every dollar figure in the UI is only meaningful alongside the model that
+// produced it, so the name is fetched once and shown wherever a cost is.
+let activeModel = null;
 
 const TYPE_LABELS = {
   python: 'Python', nodejs: 'Node.js', typescript: 'TypeScript',
@@ -56,8 +59,8 @@ async function fetchScanStatus() {
   return res.json();
 }
 
-async function triggerScan(projectIds, type = 'quick', forceRegenerate = false) {
-  const body = { type, forceRegenerate };
+async function triggerScan(projectIds, type = 'quick', forceRegenerate = false, findLinks = false) {
+  const body = { type, forceRegenerate, findLinks };
   if (projectIds) body.projectIds = projectIds;
   const res = await fetch('/api/scan', {
     method: 'POST',
@@ -132,6 +135,18 @@ function summaryOutdated(p) {
   if (!p.summary) return false;
   if (!p.commit_hash) return false;
   return p.commit_hash !== p.summary_commit_hash;
+}
+
+// Mirrors needsLinksRefresh in src/links/index.js: never checked, or the
+// project has committed since its links were found.
+function linksOutdated(p) {
+  if (!p.links_checked_at) return true;
+  if (!p.commit_hash) return false;
+  return p.commit_hash !== p.links_commit_hash;
+}
+
+function needsSummary(p) {
+  return !p.summary || summaryOutdated(p);
 }
 
 function getSummaryText(summary) {
@@ -398,6 +413,11 @@ function openModal(p) {
       </div>
     </div>
 
+    <div class="modal-section">
+      <div class="modal-section-label">Links to other projects</div>
+      <div class="modal-section-body" id="modalLinks"><span style="color:var(--text-muted);font-style:italic">Loading...</span></div>
+    </div>
+
     ${integrations.length > 0 ? `
       <div class="modal-section">
         <div class="modal-section-label">Integrations</div>
@@ -410,6 +430,7 @@ function openModal(p) {
     <div class="modal-actions">
       <button class="btn btn-secondary" id="btnQuickScanProject" title="Refresh git/dependency metadata for this project — free, no AI calls">Quick Scan</button>
       <button class="btn btn-primary" id="btnDeepScanProject" title="Generate a fresh AI summary for this project">Deep Scan</button>
+      <button class="btn btn-secondary" id="btnGenerateDocs" title="Draft a CLAUDE.md or README.md from the code — written to a temp folder, never to the project">Generate Docs</button>
       <button class="btn btn-ai-chat" id="btnAIChat" style="margin-left:auto">AI Chat</button>
     </div>
     <div class="modal-settings-row">
@@ -460,6 +481,8 @@ function openModal(p) {
   };
 
   document.getElementById('btnDeepScanProject').onclick = () => openProjectDeepScanConfirm(p);
+  loadModalLinks(p);
+  document.getElementById('btnGenerateDocs').onclick = () => openGenerateDocsDialog(p);
 
   document.getElementById('btnDeepScanIgnoreToggle').onclick = async () => {
     await setDeepScanIgnored(p.id, !p.deep_scan_ignored);
@@ -474,6 +497,54 @@ function openModal(p) {
   };
 }
 
+async function loadModalLinks(p) {
+  const el = document.getElementById('modalLinks');
+  let data;
+  try {
+    data = await fetch(`/api/projects/${p.id}/links`).then(r => r.json());
+  } catch {
+    data = null;
+  }
+  if (!el || !document.body.contains(el)) return;
+  if (!data) { el.innerHTML = '<span style="color:var(--text-muted)">Could not load links.</span>'; return; }
+
+  const links = data.links || [];
+  const head = data.checkedAt
+    ? `<div class="links-meta">Checked ${formatDate(data.checkedAt)}${data.outdated ? ' — project has committed since; a Deep Scan will refresh this' : ''}.</div>`
+    : '<div class="links-meta">This project\'s code has not been link-scanned. Run a Deep Scan with <strong>Find links</strong> ticked.' + (links.length ? ' The links below were found by scanning other projects.' : '') + '</div>';
+
+  if (links.length === 0) {
+    el.innerHTML = head + (data.checkedAt ? '<div class="links-meta">No links to other tracked projects found.</div>' : '');
+    return;
+  }
+
+  // One block per other project, its identifiers listed under it.
+  const groups = new Map();
+  for (const l of links) {
+    if (!groups.has(l.otherId)) groups.set(l.otherId, []);
+    groups.get(l.otherId).push(l);
+  }
+  el.innerHTML = head + [...groups.values()].map(ls => `
+    <div class="link-group">
+      <div class="link-other"><a href="#" data-project="${esc(ls[0].otherId)}">${esc(ls[0].otherName)}</a> <span class="link-path">${esc(ls[0].otherPath)}</span></div>
+      ${ls.map(l => `
+        <div class="link-row${l.stale ? ' is-stale' : ''}">
+          <span class="link-relation">${esc(l.relation)}</span>
+          <code>${esc(l.identifier)}</code>
+          ${l.stale ? '<span class="link-stale" title="One of the two projects has committed since this link was found">may be outdated</span>' : ''}
+          <div class="link-evidence">here: ${esc(l.myEvidence.join(', ') || '—')} · there: ${esc(l.otherEvidence.join(', ') || '—')}</div>
+        </div>`).join('')}
+    </div>`).join('');
+
+  el.querySelectorAll('a[data-project]').forEach(a => {
+    a.onclick = (e) => {
+      e.preventDefault();
+      const target = allProjects.find(x => x.id === a.dataset.project);
+      if (target) openModal(target);
+    };
+  });
+}
+
 // Polls scan status until it finishes, updating `btn`'s label, then reloads
 // and reopens the project's modal so the refreshed data is visible.
 function pollProjectScan(projectId, btn, analyzingLabel) {
@@ -483,6 +554,7 @@ function pollProjectScan(projectId, btn, analyzingLabel) {
       const phase = s.progress.phase;
       if (phase === 'analyzing') btn.textContent = analyzingLabel;
       else if (phase === 'summarizing') btn.textContent = 'Generating summary...';
+      else if (phase === 'finding links') btn.textContent = 'Finding links...';
     }
     if (!s.inProgress) {
       clearInterval(poll);
@@ -505,6 +577,149 @@ function closeModal() {
   closeChat();
 }
 
+// --- Doc drafting ---
+// Runs the read-only chat tools as a one-shot (no chat session) and writes the
+// result to a temp folder. The project is never modified: the user downloads the
+// draft or opens the folder, and the drafts are discarded when this closes.
+
+const DOC_KINDS = ['CLAUDE.md', 'README.md'];
+
+async function discardDocDrafts(projectId) {
+  try {
+    await fetch(`/api/projects/${projectId}/drafts`, { method: 'DELETE' });
+  } catch { /* the temp dir is disposable; a failed cleanup is not worth reporting */ }
+}
+
+function closeGenerateDocs(projectId) {
+  discardDocDrafts(projectId);
+  closeScanConfirm();
+}
+
+async function openGenerateDocsDialog(p) {
+  const modal = document.getElementById('scanConfirmModal');
+  const content = document.getElementById('scanConfirmContent');
+  const name = esc(p.user_label || p.name);
+
+  content.innerHTML = `
+    <button class="modal-close" id="scanConfirmClose">&times;</button>
+    <div class="modal-title">Generate Docs — ${name}</div>
+    <div class="scan-confirm-list">
+      ${DOC_KINDS.map(k => `
+        <label class="scan-confirm-row">
+          <input type="checkbox" value="${k}" ${k === 'CLAUDE.md' ? 'checked' : ''} />
+          <span>${k}</span>
+        </label>`).join('')}
+    </div>
+
+    <div class="modal-section">
+      <div class="modal-section-label">How it works</div>
+      <div class="modal-section-body">${bullets([
+        `Claude${activeModel ? ` (${activeModel})` : ''} reads the project with the same read-only tools as the project chat — list, read, search, and read-only git.`,
+        'It runs as a one-shot: no chat session is involved, and nothing is carried over from one.',
+        'Each document is written to a temp folder, <strong>never into the project</strong>. Copying it into the repo is yours to do.',
+        'Drafts are deleted when you close this dialog.',
+      ])}</div>
+    </div>
+
+    <div class="modal-section">
+      <div class="modal-section-label">Cost</div>
+      <div class="modal-section-body">${bullets([
+        'Reading the code costs more than a Deep Scan summary — expect a few cents per document rather than a fraction of one.',
+        'The exact amount is shown once it finishes.',
+      ])}</div>
+    </div>
+
+    <div class="scan-confirm-summary" id="docsStatus"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="scanConfirmCancel">Cancel</button>
+      <button class="btn btn-primary" id="docsGo" style="margin-left:auto">Generate</button>
+    </div>
+  `;
+  modal.style.display = 'flex';
+
+  const close = () => closeGenerateDocs(p.id);
+  document.getElementById('scanConfirmClose').onclick = close;
+  document.getElementById('scanConfirmCancel').onclick = close;
+  document.getElementById('scanConfirmBackdrop').onclick = close;
+
+  const statusEl = document.getElementById('docsStatus');
+  const goBtn = document.getElementById('docsGo');
+
+  goBtn.onclick = async () => {
+    const files = [...content.querySelectorAll('.scan-confirm-list input:checked')].map(i => i.value);
+    if (files.length === 0) { statusEl.textContent = 'Pick at least one document.'; return; }
+
+    goBtn.disabled = true;
+    goBtn.textContent = 'Generating...';
+    statusEl.textContent = `Reading the project and drafting ${files.join(' and ')}. This takes a minute or so.`;
+
+    try {
+      const res = await fetch(`/api/projects/${p.id}/generate-docs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ files }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Generation failed');
+      renderDocDrafts(p, data);
+    } catch (err) {
+      statusEl.textContent = err.message;
+      goBtn.disabled = false;
+      goBtn.textContent = 'Generate';
+    }
+  };
+}
+
+function renderDocDrafts(p, data) {
+  const content = document.getElementById('scanConfirmContent');
+  const name = esc(p.user_label || p.name);
+  const toolCount = (data.toolsUsed || []).length;
+
+  content.innerHTML = `
+    <button class="modal-close" id="scanConfirmClose">&times;</button>
+    <div class="modal-title">Drafts ready — ${name}</div>
+    <p style="color:var(--text-muted);font-size:12px;margin-bottom:12px">
+      ${data.files.length} file${data.files.length !== 1 ? 's' : ''} drafted after ${toolCount} tool call${toolCount !== 1 ? 's' : ''} ·
+      $${data.cost.toFixed(4)}${activeModel ? ` (${activeModel})` : ''} ·
+      ${data.inputTokens.toLocaleString()}/${data.outputTokens.toLocaleString()} tokens
+    </p>
+
+    <div class="scan-confirm-list">
+      ${data.files.map(f => `
+        <div class="scan-confirm-row">
+          <span>${esc(f.name)}</span>
+          <span class="scan-confirm-note">${(f.bytes / 1024).toFixed(1)} KB</span>
+          <a class="btn btn-secondary btn-sm" style="margin-left:8px" href="/api/projects/${p.id}/drafts/${encodeURIComponent(f.name)}" download>Download</a>
+        </div>`).join('')}
+    </div>
+
+    <div class="modal-section">
+      <div class="modal-section-label">Where they are</div>
+      <div class="modal-section-body">
+        <div class="settings-val">${esc(data.dir)}</div>
+        ${bullets(['Nothing was written to the project. These are deleted when you close this dialog, so download or copy them first.'])}
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="docsFinder">Open in Finder</button>
+      <button class="btn btn-primary" id="scanConfirmCancel" style="margin-left:auto">Done</button>
+    </div>
+  `;
+
+  const close = () => closeGenerateDocs(p.id);
+  document.getElementById('scanConfirmClose').onclick = close;
+  document.getElementById('scanConfirmCancel').onclick = close;
+  document.getElementById('scanConfirmBackdrop').onclick = close;
+  document.getElementById('docsFinder').onclick = () => {
+    fetch('/api/open-finder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: data.dir }),
+    });
+  };
+}
+
 // --- Deep Scan confirmation ---
 // Deep Scan never fires from a single click without review: bucket scans show a
 // checklist (large groups may not need every project touched), single-project
@@ -514,6 +729,38 @@ function closeModal() {
 
 function closeScanConfirm() {
   document.getElementById('scanConfirmModal').style.display = 'none';
+}
+
+// These lists mirror what the scanner actually does — src/scanner/index.js for
+// the crawl, src/analyzer/index.js for collection, src/summarizer/index.js for
+// the prompt. Keep them in step with that code; a confirmation that overstates
+// or understates what runs is worse than no confirmation.
+const METADATA_STEPS = [
+  'Walks each scan root above, up to 4 directories deep.',
+  'Skips any project you have marked <strong>Ignore</strong> — it is not analyzed and its dependencies are not re-checked. Scanning it by name from its own card still works.',
+  'Treats a folder as a project if it holds <code>.git</code>, <code>package.json</code>, <code>pyproject.toml</code> or <code>*.xcodeproj</code> — anything else is just a grouping folder.',
+  'Reads git: last commit, branch, commits in the last 30 days, and the count of uncommitted files.',
+  'Detects the project type and its top 3 languages by file extension.',
+  'Detects integrations from <code>package.json</code> / <code>pyproject.toml</code>, and Docker from <code>Dockerfile</code> or <code>docker-compose.yml</code>.',
+  'Notes whether <code>README.md</code> and <code>CLAUDE.md</code> exist.',
+  'Re-checks outdated dependencies (<code>npm outdated</code>, <code>pip list --outdated</code>, 30s cap each) — skipped where the commit has not changed since the last check.',
+];
+
+const AI_SEES = [
+  'Project name, type, languages and detected integrations.',
+  '<code>README.md</code> — the first 1200 characters only.',
+  '<code>CLAUDE.md</code> — the first 1200 characters only.',
+  'The subject lines of the last 10 commits.',
+];
+
+const AI_NEVER_SEES = [
+  'Source files, file contents and diffs — nothing beyond those two documents. (Step 3 does read source, if ticked.)',
+  '<code>.env</code> files, keys and credentials.',
+  'The directory listing or file tree.',
+];
+
+function bullets(items) {
+  return `<ul class="scan-detail-list">${items.map(i => `<li>${i}</li>`).join('')}</ul>`;
 }
 
 // formatDate() collapses anything under a day to "today", which is exactly the
@@ -610,12 +857,26 @@ async function openQuickScanConfirm() {
       <div class="modal-section-body">
         <div class="settings-kv"><span class="settings-key">Cost</span><span class="settings-val">$0.00 — no AI calls</span></div>
         <div class="settings-kv"><span class="settings-key">Currently tracked</span><span class="settings-val">${preview?.projectsTracked ?? '—'} projects</span></div>
+        ${preview?.ignoredCount ? `<div class="settings-kv"><span class="settings-key">Skipped</span><span class="settings-val">${preview.ignoredCount} ignored project${preview.ignoredCount !== 1 ? 's' : ''}</span></div>` : ''}
         <div class="settings-kv"><span class="settings-key">Typical duration</span><span class="settings-val">${avgDuration ? `~${avgDuration}` : 'no timing history yet'}</span></div>
-        <div class="scan-confirm-note-line">Re-walks the scan roots, refreshes git metadata, and re-checks dependencies for projects whose commit changed.</div>
       </div>
     </div>
 
-    <div class="scan-confirm-summary">Summaries are untouched — only a Deep Scan spends anything.</div>
+    <div class="modal-section">
+      <div class="modal-section-label">What it examines</div>
+      <div class="modal-section-body">${bullets(METADATA_STEPS)}</div>
+    </div>
+
+    <div class="modal-section">
+      <div class="modal-section-label">What it does not do</div>
+      <div class="modal-section-body">${bullets([
+        'No AI call of any kind — nothing is sent to Claude, and nothing is billed.',
+        'Existing AI summaries are left exactly as they are, including outdated ones.',
+        'Nothing is written to your projects; every git command is read-only.',
+      ])}</div>
+    </div>
+
+    <div class="scan-confirm-summary">Only a Deep Scan spends anything.</div>
     <div class="modal-actions">
       <button class="btn btn-secondary" id="scanConfirmCancel">Cancel</button>
       <button class="btn ${fresh ? 'btn-secondary' : 'btn-primary'}" id="scanConfirmGo" style="margin-left:auto">${fresh ? 'Scan anyway' : 'Run Quick Scan'}</button>
@@ -645,21 +906,100 @@ async function openQuickScanConfirm() {
   };
 }
 
-function formatCostEstimate(avgCostPerSummary, count) {
-  if (avgCostPerSummary == null) return 'No cost history yet — first Deep Scan will establish a baseline.';
-  return `~$${(avgCostPerSummary * count).toFixed(4)} estimated (${count} × ~$${avgCostPerSummary.toFixed(4)} avg/summary)`;
+// Both Deep Scan dialogs show the same breakdown: a Deep Scan is a Quick Scan
+// plus one AI call per project, and the thing worth being explicit about is
+// exactly which bytes leave the machine.
+const LINKS_AI_SEES = [
+  'Claude reads this project\'s code with read-only tools: directory listings, file contents, text search and read-only git.',
+  'It looks for what the project calls and what it serves: hostnames, API routes, domains, and cloud resource IDs such as hosted zones, certificates, buckets and tables.',
+  '<code>.env</code> files are blocked from this step.',
+];
+
+const LINKS_LOCAL = [
+  'The identifiers it reports are then searched for in every tracked project, on this machine, with no AI call.',
+  'So a match is found even in projects that have never been Deep Scanned.',
+  'Results appear under <strong>Links to other projects</strong> in each project, and the Ask AI chat uses them.',
+  'Re-run only when the project commits again.',
+];
+
+function linksDetailHtml() {
+  return `
+    <div class="modal-section links-detail">
+      <div class="modal-section-label">Step 3 — find links (when ticked)${activeModel ? ` (${activeModel})` : ''}</div>
+      <div class="modal-section-body">${bullets(LINKS_AI_SEES)}${bullets(LINKS_LOCAL)}</div>
+    </div>`;
+}
+
+function linksCheckboxHtml() {
+  return `
+    <label class="scan-confirm-row links-toggle">
+      <input type="checkbox" id="scanConfirmLinks" checked />
+      <span><strong>Find links to other projects</strong> — reads this code to find what it calls and serves. Costs more per project than a summary.</span>
+    </label>`;
+}
+
+function deepScanDetailHtml(count) {
+  const n = count === 1 ? 'this project' : `each of the ${count} selected projects`;
+  return `
+    <div class="modal-section">
+      <div class="modal-section-label">Step 1 — same metadata pass as a Quick Scan</div>
+      <div class="modal-section-body">${bullets(METADATA_STEPS.slice(3))}</div>
+    </div>
+
+    <div class="modal-section">
+      <div class="modal-section-label">Step 2 — what is sent to Claude${activeModel ? ` (${activeModel})` : ''}</div>
+      <div class="modal-section-body">${bullets(AI_SEES)}</div>
+    </div>
+
+    <div class="modal-section">
+      <div class="modal-section-label">Never sent for the summary</div>
+      <div class="modal-section-body">${bullets(AI_NEVER_SEES)}</div>
+    </div>
+
+    <div class="modal-section">
+      <div class="modal-section-label">What comes back</div>
+      <div class="modal-section-body">${bullets([
+        `A 2–3 sentence plain-text summary for ${n}, written to the project card.`,
+        'The summary is stamped with the current commit hash, so it is only regenerated once that project commits again.',
+      ])}</div>
+    </div>
+    ${linksDetailHtml()}`;
+}
+
+// Each half priced from its own history. A half with no history says so rather
+// than borrowing a number.
+function formatCostEstimate(est, summaries, links) {
+  const parts = [];
+  let total = 0;
+  let unknown = [];
+  if (summaries > 0) {
+    if (est.avgCostPerSummary == null) unknown.push(`${summaries} summar${summaries === 1 ? 'y' : 'ies'}`);
+    else { total += est.avgCostPerSummary * summaries; parts.push(`${summaries} summar${summaries === 1 ? 'y' : 'ies'} × ~$${est.avgCostPerSummary.toFixed(4)}`); }
+  }
+  if (links > 0) {
+    if (est.avgCostPerLinkScan == null) unknown.push(`${links} link scan${links === 1 ? '' : 's'}`);
+    else { total += est.avgCostPerLinkScan * links; parts.push(`${links} link scan${links === 1 ? '' : 's'} × ~$${est.avgCostPerLinkScan.toFixed(4)}`); }
+  }
+  if (summaries === 0 && links === 0) return 'Nothing to run — every selected project is already up to date.';
+  let text = parts.length ? `~$${total.toFixed(4)} estimated (${parts.join(' + ')})${modelSuffix()}` : '';
+  if (unknown.length) text += `${text ? '. ' : ''}No cost history yet for ${unknown.join(' and ')} — this run will establish it.`;
+  return text;
 }
 
 async function openBucketDeepScanConfirm(bucket) {
   const modal = document.getElementById('scanConfirmModal');
   const content = document.getElementById('scanConfirmContent');
-  const candidates = bucket.projects.filter(p => !p.summary || summaryOutdated(p));
+  // A project is listed when there is something to (re)generate for it: a
+  // missing or outdated summary, or — while "Find links" is ticked — links never
+  // found or found before its latest commit. Up-to-date projects are counted,
+  // not hidden: the dialog says how many were omitted and why.
+  const candidatesFor = (withLinks) => bucket.projects.filter(p => needsSummary(p) || (withLinks && linksOutdated(p)));
 
-  if (candidates.length === 0) {
+  if (candidatesFor(true).length === 0) {
     content.innerHTML = `
       <button class="modal-close" id="scanConfirmClose">&times;</button>
       <div class="modal-title">Deep Scan — ${esc(bucket.label)}</div>
-      <p style="color:var(--text-muted);font-size:13px">All ${bucket.projects.length} project${bucket.projects.length !== 1 ? 's' : ''} in this group already have up-to-date summaries.</p>
+      <p style="color:var(--text-muted);font-size:13px">All ${bucket.projects.length} project${bucket.projects.length !== 1 ? 's' : ''} in this group already have up-to-date summaries and links.</p>
       <div class="modal-actions"><button class="btn btn-secondary" id="scanConfirmCancel">Close</button></div>
     `;
     modal.style.display = 'flex';
@@ -669,7 +1009,7 @@ async function openBucketDeepScanConfirm(bucket) {
     return;
   }
 
-  const [{ avgCostPerSummary }, cfg] = await Promise.all([
+  const [est, cfg] = await Promise.all([
     fetchCostEstimate(),
     fetch('/api/config').then(r => r.json()).catch(() => null),
   ]);
@@ -678,17 +1018,11 @@ async function openBucketDeepScanConfirm(bucket) {
   content.innerHTML = `
     <button class="modal-close" id="scanConfirmClose">&times;</button>
     <div class="modal-title">Deep Scan — ${esc(bucket.label)}</div>
-    <p style="color:var(--text-muted);font-size:12px;margin-bottom:12px">Review the projects below — uncheck any you don't want summarized right now.</p>
-    <div class="scan-confirm-list" id="scanConfirmList">
-      ${candidates.map(p => `
-        <label class="scan-confirm-row">
-          <input type="checkbox" value="${p.id}" ${p.deep_scan_ignored ? '' : 'checked'} />
-          <span>${esc(p.user_label || p.name)}</span>
-          ${p.deep_scan_ignored ? '<span class="scan-confirm-note">skip-AI</span>' : ''}
-        </label>
-      `).join('')}
-    </div>
+    ${linksCheckboxHtml()}
+    <p style="color:var(--text-muted);font-size:12px;margin:12px 0" id="scanConfirmIntro"></p>
+    <div class="scan-confirm-list" id="scanConfirmList"></div>
     <div class="scan-confirm-summary" id="scanConfirmSummary"></div>
+    <div id="scanConfirmDetail"></div>
     <div class="modal-actions">
       <button class="btn btn-secondary" id="scanConfirmCancel">Cancel</button>
       <button class="btn btn-primary" id="scanConfirmGo" style="margin-left:auto">Run Deep Scan</button>
@@ -699,9 +1033,38 @@ async function openBucketDeepScanConfirm(bucket) {
   const list = document.getElementById('scanConfirmList');
   const summaryEl = document.getElementById('scanConfirmSummary');
   const goBtn = document.getElementById('scanConfirmGo');
+  const linksBox = document.getElementById('scanConfirmLinks');
+  const unchecked = new Set(bucket.projects.filter(p => p.deep_scan_ignored).map(p => p.id));
+
+  function renderList() {
+    const withLinks = linksBox.checked;
+    const candidates = candidatesFor(withLinks);
+    const omitted = bucket.projects.length - candidates.length;
+    document.getElementById('scanConfirmIntro').innerHTML = `Review the projects below — uncheck any you don't want scanned right now.${
+      omitted
+        ? ` <br><span style="color:var(--text-dim)">${omitted} of this group's ${bucket.projects.length} project${bucket.projects.length !== 1 ? 's' : ''} ${omitted === 1 ? 'is' : 'are'} not listed: ${omitted === 1 ? 'its' : 'their'} summary${withLinks ? ' and links' : ''} already match${omitted === 1 ? 'es' : ''} the current commit, so re-running would cost money and change nothing. Use a project's own <strong>Deep Scan</strong> button to force one anyway.</span>`
+        : ''
+    }`;
+    list.innerHTML = candidates.map(p => {
+      const todo = [needsSummary(p) ? 'summary' : null, withLinks && linksOutdated(p) ? 'links' : null].filter(Boolean).join(' + ');
+      return `
+        <label class="scan-confirm-row">
+          <input type="checkbox" value="${p.id}" ${unchecked.has(p.id) ? '' : 'checked'} />
+          <span>${esc(p.user_label || p.name)}</span>
+          <span class="scan-confirm-note">${todo}</span>
+          ${p.deep_scan_ignored ? '<span class="scan-confirm-note">skip-AI</span>' : ''}
+        </label>`;
+    }).join('');
+    document.getElementById('scanConfirmDetail').innerHTML = deepScanDetailHtml(candidates.length);
+    document.querySelector('#scanConfirmDetail .links-detail').style.display = withLinks ? '' : 'none';
+    refresh();
+  }
 
   function refresh() {
     const selected = [...list.querySelectorAll('input:checked')].map(i => i.value);
+    const picked = bucket.projects.filter(p => selected.includes(p.id));
+    const nSummaries = picked.filter(needsSummary).length;
+    const nLinks = linksBox.checked ? picked.filter(linksOutdated).length : 0;
     if (selected.length === 0) {
       summaryEl.textContent = 'Select at least one project.';
       goBtn.disabled = true;
@@ -709,13 +1072,20 @@ async function openBucketDeepScanConfirm(bucket) {
       summaryEl.textContent = `${selected.length} selected exceeds the per-scan cap of ${cap} — deselect some.`;
       goBtn.disabled = true;
     } else {
-      summaryEl.textContent = formatCostEstimate(avgCostPerSummary, selected.length);
+      summaryEl.textContent = formatCostEstimate(est, nSummaries, nLinks);
       goBtn.disabled = false;
     }
     return selected;
   }
-  list.addEventListener('change', refresh);
-  refresh();
+
+  list.addEventListener('change', (e) => {
+    if (e.target.type === 'checkbox') {
+      if (e.target.checked) unchecked.delete(e.target.value); else unchecked.add(e.target.value);
+    }
+    refresh();
+  });
+  linksBox.addEventListener('change', renderList);
+  renderList();
 
   document.getElementById('scanConfirmClose').onclick = closeScanConfirm;
   document.getElementById('scanConfirmCancel').onclick = closeScanConfirm;
@@ -726,7 +1096,7 @@ async function openBucketDeepScanConfirm(bucket) {
     if (selected.length === 0 || selected.length > cap) return;
     goBtn.disabled = true;
     goBtn.textContent = 'Starting...';
-    triggerScan(selected, 'deep').then(() => {
+    triggerScan(selected, 'deep', false, linksBox.checked).then(() => {
       closeScanConfirm();
       setScanUIState(true);
       document.getElementById('scanStatus').textContent = `Deep scanning ${bucket.label} (${selected.length})...`;
@@ -744,14 +1114,15 @@ async function openProjectDeepScanConfirm(p) {
   const modal = document.getElementById('scanConfirmModal');
   const content = document.getElementById('scanConfirmContent');
 
-  const { avgCostPerSummary } = await fetchCostEstimate();
+  const est = await fetchCostEstimate();
 
   content.innerHTML = `
     <button class="modal-close" id="scanConfirmClose">&times;</button>
     <div class="modal-title">Deep Scan — ${esc(p.user_label || p.name)}</div>
-    <p style="color:var(--text-muted);font-size:13px;margin-bottom:6px">${formatCostEstimate(avgCostPerSummary, 1)}</p>
-    <p style="color:var(--text-muted);font-size:13px;margin-bottom:6px">Also re-checks dependencies, which may take a few seconds.</p>
-    ${p.deep_scan_ignored ? '<p style="color:var(--warning);font-size:13px">This project is marked to skip AI summaries — this run overrides that once; the flag itself won\'t change.</p>' : ''}
+    ${linksCheckboxHtml()}
+    <p style="color:var(--text-muted);font-size:13px;margin:12px 0" id="scanConfirmCost"></p>
+    ${p.deep_scan_ignored ? '<p style="color:var(--warning);font-size:13px;margin-bottom:12px">This project is marked to skip AI summaries — this run overrides that once; the flag itself won\'t change.</p>' : ''}
+    ${deepScanDetailHtml(1)}
     <div class="modal-actions">
       <button class="btn btn-secondary" id="scanConfirmCancel">Cancel</button>
       <button class="btn btn-primary" id="scanConfirmGo" style="margin-left:auto">Run Deep Scan</button>
@@ -759,17 +1130,27 @@ async function openProjectDeepScanConfirm(p) {
   `;
   modal.style.display = 'flex';
 
+  // A single-project Deep Scan forces both halves, so both are always priced.
+  const linksBox = document.getElementById('scanConfirmLinks');
+  const syncLinks = () => {
+    document.getElementById('scanConfirmCost').textContent = formatCostEstimate(est, 1, linksBox.checked ? 1 : 0);
+    content.querySelector('.links-detail').style.display = linksBox.checked ? '' : 'none';
+  };
+  linksBox.addEventListener('change', syncLinks);
+  syncLinks();
+
   document.getElementById('scanConfirmClose').onclick = closeScanConfirm;
   document.getElementById('scanConfirmCancel').onclick = closeScanConfirm;
   document.getElementById('scanConfirmBackdrop').onclick = closeScanConfirm;
 
   document.getElementById('scanConfirmGo').onclick = () => {
+    const withLinks = linksBox.checked;
     closeScanConfirm();
     const btn = document.getElementById('btnDeepScanProject');
     const summaryEl = document.getElementById('modalSummary');
     if (btn) { btn.disabled = true; btn.textContent = 'Analyzing...'; }
     if (summaryEl) summaryEl.innerHTML = '<span style="color:var(--accent);font-style:italic">Scanning project and generating summary...</span>';
-    triggerScan([p.id], 'deep', true).then(() => pollProjectScan(p.id, btn, 'Analyzing...'));
+    triggerScan([p.id], 'deep', true, withLinks).then(() => pollProjectScan(p.id, btn, 'Analyzing...'));
   };
 }
 
@@ -831,11 +1212,12 @@ const PHASE_LABELS = {
   analyzing: 'Analyzing',
   'checking deps': 'Checking deps',
   summarizing: 'Generating summaries',
+  'finding links': 'Finding links',
 };
 
 function formatProgress(progress) {
   if (!progress) return 'Scanning...';
-  const { phase, projectsCurrent, projectsTotal, summariesCurrent, summariesTotal, currentProjectName, estimatedCost } = progress;
+  const { phase, projectsCurrent, projectsTotal, summariesCurrent, summariesTotal, linksCurrent, linksTotal, currentProjectName, estimatedCost } = progress;
 
   if (phase === 'discovering') return 'Discovering projects...';
 
@@ -844,9 +1226,11 @@ function formatProgress(progress) {
     text += ` ${projectsCurrent}/${projectsTotal}`;
   } else if (phase === 'summarizing') {
     text += ` ${summariesCurrent}/${summariesTotal}`;
+  } else if (phase === 'finding links') {
+    text += ` ${linksCurrent}/${linksTotal}`;
   }
   if (currentProjectName) text += ` — ${currentProjectName}`;
-  if (estimatedCost > 0) text += ` · $${estimatedCost.toFixed(4)}`;
+  if (estimatedCost > 0) text += ` · $${estimatedCost.toFixed(4)}${modelSuffix()}`;
   return text;
 }
 
@@ -969,10 +1353,20 @@ async function updateScanStatus() {
   }
 }
 
+function modelSuffix() {
+  return activeModel ? ` (${activeModel})` : '';
+}
+
 function formatCost(run) {
-  if (!run || !run.summaries_generated) return '';
+  if (!run || (!run.summaries_generated && !run.links_generated && !run.links_failed)) return '';
   const cost = (run.estimated_cost_usd || 0).toFixed(4);
-  return ` · ${run.summaries_generated} summaries · $${cost} · ${(run.input_tokens || 0).toLocaleString()}/${(run.output_tokens || 0).toLocaleString()} tokens`;
+  const what = [
+    run.summaries_generated ? `${run.summaries_generated} summar${run.summaries_generated === 1 ? 'y' : 'ies'}` : null,
+    run.links_generated ? `${run.links_generated} link scan${run.links_generated === 1 ? '' : 's'}` : null,
+    // Failed link scans leave the old links in place; rerunning the Deep Scan retries them.
+    run.links_failed ? `${run.links_failed} link scan${run.links_failed === 1 ? '' : 's'} failed — rerun to retry` : null,
+  ].filter(Boolean).join(', ');
+  return ` · ${what} · $${cost}${modelSuffix()} · ${(run.input_tokens || 0).toLocaleString()}/${(run.output_tokens || 0).toLocaleString()} tokens`;
 }
 
 function showScanDone(run) {
@@ -1176,12 +1570,13 @@ async function sendChatMessage() {
         } else if (data.type === 'tool_start') {
           showToolActivity(`Reading: ${data.name}...`);
         } else if (data.type === 'tool_exec') {
-          const label = data.name === 'read_file' ? data.input.relative_path
-            : data.name === 'write_file' ? `writing ${data.input.relative_path}`
+          const where = data.input.project ? `${data.input.project.split('/').pop()}: ` : '';
+          const label = data.name === 'search_all_projects' ? `searching all projects for "${data.input.pattern}"`
+            : where + (data.name === 'read_file' ? data.input.relative_path
             : data.name === 'list_directory' ? `listing ${data.input.relative_path || '.'}`
             : data.name === 'search_files' ? `searching "${data.input.pattern}"`
             : data.name === 'git_command' ? `git ${data.input.args}`
-            : data.name;
+            : data.name);
           showToolActivity(`Executing: ${label}`);
         } else if (data.type === 'done') {
           showToolActivity('');
@@ -1293,6 +1688,7 @@ function initChatResize() {
 }
 
 async function init() {
+  activeModel = await fetch('/api/config').then(r => r.json()).then(c => c.model).catch(() => null);
   await reload();
   await updateScanStatus();
   initChatResize();

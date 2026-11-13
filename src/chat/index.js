@@ -9,6 +9,22 @@ function getClient() {
   return client;
 }
 
+// Thinking tokens count toward max_tokens, so a hard question can spend the whole
+// budget reasoning and return no text at all. Rendering that as an empty reply
+// tells the user nothing happened, which is false — say what happened instead.
+function truncationNotice(finalMessage, yieldedText) {
+  if (finalMessage.stop_reason !== 'max_tokens') return null;
+  return yieldedText
+    ? '\n\n[Reply cut off at the length limit. Ask for a narrower slice to see the rest.]'
+    : '[No reply: the model spent its whole output limit reasoning. Ask a narrower question.]';
+}
+
+// The first content block is not necessarily the text: with thinking on it is a
+// thinking block, and content[0].text is undefined.
+function textOf(message) {
+  return message.content.filter(b => b.type === 'text').map(b => b.text).join('');
+}
+
 // In-memory sessions keyed by project ID
 const sessions = new Map();
 
@@ -82,24 +98,6 @@ const TOOLS = [
     },
   },
   {
-    name: 'write_file',
-    description: 'Write content to a file within the project. Creates the file (and any missing parent directories) if it does not exist, or overwrites it if it does.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        relative_path: {
-          type: 'string',
-          description: 'File path relative to project root.',
-        },
-        content: {
-          type: 'string',
-          description: 'Full content to write to the file.',
-        },
-      },
-      required: ['relative_path', 'content'],
-    },
-  },
-  {
     name: 'git_command',
     description: 'Run a read-only git command in the project directory. Only safe, read-only git subcommands are allowed (log, diff, show, status, branch, tag, blame, etc.). No push, pull, commit, checkout, reset, or any write operations.',
     input_schema: {
@@ -129,17 +127,28 @@ const SKIP_DIRS = new Set([
 function safePath(projectRoot, relativePath) {
   const cleaned = (relativePath || '.').replace(/\.\./g, '');
   const full = path.resolve(projectRoot, cleaned);
-  if (!full.startsWith(projectRoot)) return null;
+  // A bare startsWith would let /a/proj reach its sibling /a/proj2.
+  if (full !== projectRoot && !full.startsWith(projectRoot + path.sep)) return null;
   return full;
 }
 
+// A tool must never throw out of the chat loop: the model controls the inputs,
+// so a bad one (an invalid regex from search_files, say) would otherwise abort
+// the whole conversation instead of being handed back as a correctable error.
 function executeTool(toolName, input, projectRoot) {
+  try {
+    return dispatchTool(toolName, input, projectRoot);
+  } catch (err) {
+    return { error: `${toolName} failed: ${err.message}` };
+  }
+}
+
+function dispatchTool(toolName, input, projectRoot) {
   switch (toolName) {
     case 'list_directory': return listDirectory(projectRoot, input.relative_path);
     case 'read_file': return readFile(projectRoot, input.relative_path, input.offset, input.limit);
     case 'get_file_info': return getFileInfo(projectRoot, input.relative_path);
     case 'search_files': return searchFiles(projectRoot, input.pattern, input.glob);
-    case 'write_file': return writeFile(projectRoot, input.relative_path, input.content);
     case 'git_command': return gitCommand(projectRoot, input.args);
     default: return { error: `Unknown tool: ${toolName}` };
   }
@@ -212,19 +221,6 @@ function readFile(projectRoot, relativePath, offset = 0, limit = 200) {
       totalLines: lines.length,
       showing: `${offset + 1}-${Math.min(offset + limit, lines.length)} of ${lines.length}`,
     };
-  } catch (err) {
-    return { error: err.message };
-  }
-}
-
-function writeFile(projectRoot, relativePath, content) {
-  const full = safePath(projectRoot, relativePath);
-  if (!full) return { error: 'Invalid path' };
-
-  try {
-    fs.mkdirSync(path.dirname(full), { recursive: true });
-    fs.writeFileSync(full, content, 'utf8');
-    return { ok: true, path: relativePath, bytes: Buffer.byteLength(content, 'utf8') };
   } catch (err) {
     return { error: err.message };
   }
@@ -313,7 +309,7 @@ ${project.summary ? `AI Summary:\n${project.summary}\n` : ''}
 
 RULES:
 - You are scoped to this project directory. No access outside it, no deletes.
-- You can read and write files within this project using the provided tools.
+- Your tools are read-only. You cannot create, modify or delete files.
 - Use the provided tools to explore the project when you need more information.
 - Be concise. Answer questions directly.
 - If asked about something outside this project, decline politely.`;
@@ -381,11 +377,11 @@ Write the condensed summary. Format it as a clear, scannable recap that the AI c
   try {
     const response = await getClient().messages.create({
       model: MODEL,
-      max_tokens: 1024,
+      max_tokens: 4096,
       messages: [{ role: 'user', content: condensationPrompt }],
     });
 
-    const condensed = response.content[0].text.trim();
+    const condensed = textOf(response).trim();
 
     // Replace entire session with the condensed context
     session.messages = [
@@ -410,12 +406,13 @@ async function* chat(project, userMessage) {
   while (true) {
     const stream = getClient().messages.stream({
       model: MODEL,
-      max_tokens: 1024,
+      max_tokens: 4096,
       system: systemPrompt,
       tools: TOOLS,
       messages: session.messages,
     });
 
+    let sawText = false;
     for await (const event of stream) {
       if (event.type === 'content_block_start') {
         if (event.content_block.type === 'tool_use') {
@@ -423,6 +420,7 @@ async function* chat(project, userMessage) {
         }
       } else if (event.type === 'content_block_delta') {
         if (event.delta.type === 'text_delta') {
+          sawText = true;
           yield { type: 'text', text: event.delta.text };
         }
       }
@@ -430,6 +428,9 @@ async function* chat(project, userMessage) {
 
     const finalMessage = await stream.finalMessage();
     session.messages.push({ role: 'assistant', content: finalMessage.content });
+
+    const notice = truncationNotice(finalMessage, sawText);
+    if (notice) yield { type: 'text', text: notice };
 
     if (finalMessage.stop_reason === 'tool_use') {
       // Execute all tool calls
@@ -442,6 +443,7 @@ async function* chat(project, userMessage) {
             type: 'tool_result',
             tool_use_id: block.id,
             content: JSON.stringify(result),
+            ...(result && result.error ? { is_error: true } : {}),
           });
         }
       }
@@ -460,7 +462,10 @@ function tryParseArr(val) {
   try { const r = JSON.parse(val); return Array.isArray(r) ? r : []; } catch { return []; }
 }
 
-function buildGlobalSystemPrompt(projects) {
+function buildGlobalSystemPrompt(projects, allLinks = []) {
+  // Required here, not at the top: links/ requires this module for TOOLS.
+  const { linksFor } = require('../links');
+  const byId = new Map(projects.map(p => [p.id, p]));
   const lines = [
     'You are a project discovery assistant for the Sauron development dashboard.',
     `You have metadata for ${projects.length} scanned projects in the user\'s development environment.`,
@@ -483,41 +488,194 @@ function buildGlobalSystemPrompt(projects) {
     lines.push(`- Last commit: ${daysAgo !== null ? `${daysAgo}d ago` : 'no commits'}${p.last_commit_message ? ` — "${p.last_commit_message}"` : ''}`);
     if (integrations.length) lines.push(`- Integrations: ${integrations.join(', ')}`);
     if (summaryText) lines.push(`- Summary: ${summaryText}`);
+    const links = allLinks.length ? linksFor(p.id, allLinks, byId) : [];
+    if (links.length) {
+      lines.push(`- Links: ${links.slice(0, 12).map(l => `${l.relation.toLowerCase()} ${l.otherName} (${l.identifier})${l.stale ? ' [may be outdated]' : ''}`).join('; ')}`);
+    }
     lines.push('');
   }
 
   lines.push('RESPONSE STYLE — CRITICAL:');
   lines.push('- Return ONLY what was asked for. Nothing else.');
-  lines.push('- If asked to find projects: return project names only, one per line. No descriptions, no dates, no headers, no grouping, no commentary.');
+  lines.push('- If asked to find or list projects: return project names only, one per line. No descriptions, no dates, no headers, no grouping, no commentary.');
+  lines.push('- Exception: when asked what handles, serves or supports a project, give the project, its path, and the file:line evidence from step 4.');
   lines.push('- Add a description ONLY if the user explicitly asks for one.');
   lines.push('- Never editorialize. Never add "most active", "note:", "tip:", or any unsolicited context.');
-  lines.push('- You cannot read files — use only the metadata above.');
+  lines.push('');
+  lines.push('LINKS: "Links" lines come from Deep Scan link finding — identifiers (domains, routes, cloud resource IDs) found in both projects\' code. Use them first for questions about what serves or depends on what. A project with no Links line may simply not have been link-scanned; fall back to the method below.');
+  lines.push('');
+  lines.push('TOOLS:');
+  lines.push('- The index above is metadata only. When a question depends on code, config or references between projects, search with search_all_projects and read with the per-project tools. Do not answer "no" from metadata alone when a search could settle it.');
+  lines.push('- Per-project tools take a "project" argument: the project path from the index (preferred) or its exact name.');
+  lines.push('- All tools are read-only.');
+  lines.push('');
+  lines.push('FINDING WHAT SERVES, HANDLES OR SUPPORTS A PROJECT:');
+  lines.push('Applies to any question of the form "what handles / serves / supports / backs / talks to X", where X is a project, its name, or its path.');
+  lines.push('Other code almost never names a project\'s folder path or folder name, so do not search for the path or name — go straight to step 1. Trace the connection through the identifiers the code actually uses:');
+  lines.push('1. In the named project, search_files for outbound endpoints: "https?://", "baseURL|base_url|BASE_URL|endpoint|apiUrl|API_URL|host", and the network client files (APIClient, api.ts, client.py, etc.). Read the client to collect hostnames, base paths and route names.');
+  lines.push('2. search_all_projects for each hostname/domain, then for distinctive route names (multi-word route names, not single common words). Ignore generic ones like "auth" or "files".');
+  lines.push('3. Read the matching project\'s route definitions and infrastructure (FastAPI/Express routes, CDK/Terraform domain config) to confirm it serves those routes on that domain.');
+  lines.push('4. Answer with the serving project, its path, and the file:line evidence on both sides. If step 1 finds no endpoints or step 2 finds no match, say exactly which identifiers you searched for.');
+  lines.push('Never answer "nothing handles it" or "no other project" until steps 1-2 are done.');
+  lines.push('The same method applies in reverse ("what calls this API?"): collect the routes and domain a backend serves, then search_all_projects for them.');
 
   return lines.join('\n');
 }
 
-async function* globalChat(projects, userMessage) {
+// Global chat tools: one fleet-wide search, plus the per-project tools with a
+// "project" argument naming which tracked project to run against.
+const GLOBAL_TOOLS = [
+  {
+    name: 'search_all_projects',
+    description: 'Search file contents across every tracked project at once (ripgrep, case-insensitive). Returns matches grouped by project. Use this to find which projects reference a path, name, URL, API, or identifier.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Regex (Rust/ripgrep syntax) or plain text.' },
+        glob: { type: 'string', description: 'Optional file glob filter, e.g. "*.swift" or "*.{ts,js}".' },
+      },
+      required: ['pattern'],
+    },
+  },
+  ...TOOLS.map(t => ({
+    ...t,
+    input_schema: {
+      ...t.input_schema,
+      properties: {
+        project: { type: 'string', description: 'Project path from the index (preferred) or exact project name.' },
+        ...t.input_schema.properties,
+      },
+      required: ['project', ...t.input_schema.required],
+    },
+  })),
+];
+
+const RG_EXCLUDES = [...SKIP_DIRS, 'DerivedData', 'Pods', '.build', '*.xcassets'];
+
+function searchAllProjects(projects, pattern, glob) {
+  if (!pattern || typeof pattern !== 'string') return { error: 'No pattern provided' };
+  // The index can hold projects deleted since the last scan; rg exits 2 on them.
+  projects = projects.filter(p => fs.existsSync(p.path));
+  const { execFileSync } = require('child_process');
+  const args = ['-n', '-i', '--no-heading', '--max-count', '5', '--max-filesize', '512K', '--max-columns', '200'];
+  for (const d of RG_EXCLUDES) args.push('-g', `!${d}`);
+  if (glob) args.push('-g', glob);
+  args.push('-e', pattern, '--', ...projects.map(p => p.path));
+
+  let out;
+  try {
+    out = execFileSync('rg', args, { encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 * 8, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (err) {
+    if (err.code === 'ENOENT') return { error: 'ripgrep (rg) is not installed on this machine.' };
+    if (err.status === 1) return { message: `No matches in ${projects.length} projects.` };
+    // status 2 with output means some paths were unreadable; keep what matched.
+    if (err.status === 2 && err.stdout) out = err.stdout;
+    else return { error: (err.stderr || err.message).slice(0, 500) };
+  }
+
+  // Longest path first, so a nested project claims its own files.
+  const roots = [...projects].sort((a, b) => b.path.length - a.path.length);
+  const byProject = new Map();
+  let total = 0;
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const m = line.match(/^(.*?):(\d+):(.*)$/);
+    if (!m) continue;
+    const owner = roots.find(p => m[1] === p.path || m[1].startsWith(p.path + path.sep));
+    if (!owner) continue;
+    if (!byProject.has(owner.path)) byProject.set(owner.path, { project: owner.name, path: owner.path, matches: [] });
+    const entry = byProject.get(owner.path);
+    total++;
+    if (entry.matches.length < 10) {
+      entry.matches.push({ file: path.relative(owner.path, m[1]), line: Number(m[2]), text: m[3].trim().slice(0, 160) });
+    }
+  }
+  const results = [...byProject.values()].slice(0, 40);
+  return {
+    projectsSearched: projects.length,
+    projectsMatched: byProject.size,
+    totalMatches: total,
+    ...(byProject.size > results.length ? { note: `Showing 40 of ${byProject.size} matching projects. Narrow the pattern or glob.` } : {}),
+    results,
+  };
+}
+
+function resolveProject(projects, ref) {
+  if (!ref || typeof ref !== 'string') return { error: 'No project given' };
+  const byPath = projects.find(p => p.path === ref);
+  if (byPath) return { project: byPath };
+  const byName = projects.filter(p => p.name.toLowerCase() === ref.toLowerCase());
+  if (byName.length === 1) return { project: byName[0] };
+  if (byName.length > 1) return { error: `"${ref}" matches several projects; pass the path instead: ${byName.map(p => p.path).join(', ')}` };
+  return { error: `No tracked project named or located at "${ref}".` };
+}
+
+function executeGlobalTool(name, input, projects) {
+  try {
+    if (name === 'search_all_projects') return searchAllProjects(projects, input.pattern, input.glob);
+    const resolved = resolveProject(projects, input.project);
+    if (resolved.error) return { error: resolved.error };
+    return dispatchTool(name, input, resolved.project.path);
+  } catch (err) {
+    return { error: `${name} failed: ${err.message}` };
+  }
+}
+
+async function* globalChat(projects, userMessage, allLinks = []) {
   const session = getSession('global');
   session.messages.push({ role: 'user', content: userMessage });
 
-  const systemPrompt = buildGlobalSystemPrompt(projects);
+  const systemPrompt = buildGlobalSystemPrompt(projects, allLinks);
 
-  const stream = getClient().messages.stream({
-    model: MODEL,
-    max_tokens: 2048,
-    system: systemPrompt,
-    messages: session.messages,
-  });
+  while (true) {
+    const stream = getClient().messages.stream({
+      model: MODEL,
+      // 32768: thinking counts toward max_tokens, and a fleet-wide counting
+      // question over ~450 projects burns tens of thousands of tokens reasoning
+      // before writing a word. 16384 still came back empty against the real
+      // system prompt. Streaming, so the large ceiling costs nothing when unused.
+      max_tokens: 32768,
+      system: systemPrompt,
+      tools: GLOBAL_TOOLS,
+      messages: session.messages,
+    });
 
-  for await (const event of stream) {
-    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-      yield { type: 'text', text: event.delta.text };
+    let sawText = false;
+    for await (const event of stream) {
+      if (event.type === 'content_block_start' && event.content_block.type === 'tool_use') {
+        yield { type: 'tool_start', name: event.content_block.name };
+      } else if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+        sawText = true;
+        yield { type: 'text', text: event.delta.text };
+      }
     }
+
+    const finalMessage = await stream.finalMessage();
+    session.messages.push({ role: 'assistant', content: finalMessage.content });
+
+    const notice = truncationNotice(finalMessage, sawText);
+    if (notice) yield { type: 'text', text: notice };
+
+    if (finalMessage.stop_reason !== 'tool_use') break;
+
+    const toolResults = [];
+    for (const block of finalMessage.content) {
+      if (block.type !== 'tool_use') continue;
+      yield { type: 'tool_exec', name: block.name, input: block.input };
+      const result = executeGlobalTool(block.name, block.input, projects);
+      toolResults.push({
+        type: 'tool_result',
+        tool_use_id: block.id,
+        content: JSON.stringify(result),
+        ...(result && result.error ? { is_error: true } : {}),
+      });
+    }
+    session.messages.push({ role: 'user', content: toolResults });
   }
 
-  const finalMessage = await stream.finalMessage();
-  session.messages.push({ role: 'assistant', content: finalMessage.content });
   yield { type: 'done' };
 }
 
-module.exports = { chat, globalChat, clearSession, condenseSession, getSession };
+// TOOLS and executeTool are shared with the doc generator, which runs the same
+// read-only tool loop outside a chat session.
+module.exports = { chat, globalChat, clearSession, condenseSession, getSession, TOOLS, executeTool };

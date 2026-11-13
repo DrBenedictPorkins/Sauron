@@ -69,7 +69,31 @@ function migrate(db) {
   addColumn('projects', 'status', 'TEXT');
   addColumn('projects', 'commit_hash', 'TEXT');
   addColumn('projects', 'deep_scan_ignored', 'INTEGER DEFAULT 0');
+  addColumn('projects', 'link_facts', 'TEXT');
+  addColumn('projects', 'links_commit_hash', 'TEXT');
+  addColumn('projects', 'links_checked_at', 'INTEGER');
   addColumn('scan_runs', 'scope', 'TEXT');
+  addColumn('scan_runs', 'links_generated', 'INTEGER DEFAULT 0');
+  addColumn('scan_runs', 'links_cost_usd', 'REAL DEFAULT 0');
+  addColumn('scan_runs', 'links_failed', 'INTEGER DEFAULT 0');
+
+  // One row per (scanned project, other project, identifier). Written from the
+  // scanned project's side; read from either side (see links/linksFor).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS project_links (
+      project_id TEXT NOT NULL,
+      other_id TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      kind TEXT,
+      identifier TEXT NOT NULL,
+      evidence TEXT,
+      other_evidence TEXT,
+      other_commit TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_project_links_project ON project_links(project_id);
+    CREATE INDEX IF NOT EXISTS idx_project_links_other ON project_links(other_id);
+  `);
   addColumn('scan_runs', 'summaries_generated', 'INTEGER DEFAULT 0');
   addColumn('scan_runs', 'input_tokens', 'INTEGER DEFAULT 0');
   addColumn('scan_runs', 'output_tokens', 'INTEGER DEFAULT 0');
@@ -153,13 +177,51 @@ function startScanRun(type, scope = 'fleet') {
   return result.lastInsertRowid;
 }
 
+// estimatedCost is the run's total; linksCost is the part of it spent on link
+// finding, kept separately so the per-summary average isn't inflated by it.
 function finishScanRun(runId, found, updated, tokenUsage = {}) {
-  const { inputTokens = 0, outputTokens = 0, estimatedCost = 0, summariesGenerated = 0 } = tokenUsage;
+  const { inputTokens = 0, outputTokens = 0, estimatedCost = 0, summariesGenerated = 0,
+    linksGenerated = 0, linksCost = 0, linksFailed = 0 } = tokenUsage;
   getDb().prepare(
     `UPDATE scan_runs SET finished_at = ?, projects_found = ?, projects_updated = ?,
-     summaries_generated = ?, input_tokens = ?, output_tokens = ?, estimated_cost_usd = ?
+     summaries_generated = ?, input_tokens = ?, output_tokens = ?, estimated_cost_usd = ?,
+     links_generated = ?, links_cost_usd = ?, links_failed = ?
      WHERE id = ?`
-  ).run(Date.now(), found, updated, summariesGenerated, inputTokens, outputTokens, estimatedCost, runId);
+  ).run(Date.now(), found, updated, summariesGenerated, inputTokens, outputTokens, estimatedCost,
+    linksGenerated, linksCost, linksFailed, runId);
+}
+
+function saveLinks(projectId, facts, commitHash, edges) {
+  const db = getDb();
+  const now = Date.now();
+  const insert = db.prepare(
+    `INSERT INTO project_links (project_id, other_id, direction, kind, identifier, evidence, other_evidence, other_commit, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  db.transaction(() => {
+    db.prepare('DELETE FROM project_links WHERE project_id = ?').run(projectId);
+    for (const e of edges) {
+      insert.run(projectId, e.other_id, e.direction, e.kind, e.identifier, e.evidence,
+        JSON.stringify(e.other_evidence), e.other_commit, now);
+    }
+    db.prepare('UPDATE projects SET link_facts = ?, links_commit_hash = ?, links_checked_at = ? WHERE id = ?')
+      .run(JSON.stringify(facts), commitHash, now, projectId);
+  })();
+}
+
+function getAllLinks() {
+  return getDb().prepare('SELECT * FROM project_links').all();
+}
+
+function getLinksTouching(projectId) {
+  return getDb().prepare('SELECT * FROM project_links WHERE project_id = ? OR other_id = ?').all(projectId, projectId);
+}
+
+function getAverageLinkCost() {
+  const row = getDb().prepare(
+    'SELECT SUM(links_cost_usd) AS cost, SUM(links_generated) AS n FROM scan_runs WHERE links_generated > 0'
+  ).get();
+  return row && row.n ? row.cost / row.n : null;
 }
 
 function updateDeps(projectId, staleDeps, commitHash) {
@@ -193,9 +255,13 @@ function countProjects({ includeIgnored = false } = {}) {
   return getDb().prepare(`SELECT COUNT(*) AS n FROM projects ${where}`).get().n;
 }
 
+function countIgnoredProjects() {
+  return getDb().prepare('SELECT COUNT(*) AS n FROM projects WHERE ignored = 1').get().n;
+}
+
 function getAverageSummaryCost() {
   const row = getDb().prepare(
-    `SELECT AVG(estimated_cost_usd * 1.0 / summaries_generated) AS avg
+    `SELECT AVG((estimated_cost_usd - COALESCE(links_cost_usd, 0)) * 1.0 / summaries_generated) AS avg
      FROM scan_runs WHERE summaries_generated > 0`
   ).get();
   return row && row.avg != null ? row.avg : null;
@@ -205,5 +271,6 @@ module.exports = {
   getDb, upsertProject, updateSummary, updateDeps, getProjects, getProject,
   setIgnored, setDeepScanIgnored, setUserLabel, startScanRun, finishScanRun,
   getRecentScanRun, getAverageSummaryCost, getLastFleetQuickScan,
-  getAverageQuickScanDuration, countProjects
+  getAverageQuickScanDuration, countProjects, countIgnoredProjects,
+  saveLinks, getAllLinks, getLinksTouching, getAverageLinkCost
 };

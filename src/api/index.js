@@ -2,10 +2,13 @@ const express = require('express');
 const path = require('path');
 const db = require('../db');
 const config = require('../config');
+const { MODEL } = require('../models');
 const { runScan, isScanInProgress, getProgress, requestStop } = require('../scanner/orchestrator');
 const { analyze } = require('../analyzer');
 const { summarize } = require('../summarizer');
 const { chat, globalChat, clearSession, condenseSession } = require('../chat');
+const docgen = require('../docgen');
+const { linksFor } = require('../links');
 
 function createApp() {
   const app = express();
@@ -57,12 +60,59 @@ function createApp() {
     }
   });
 
+  app.get('/api/projects/:id/links', (req, res) => {
+    const project = db.getProject(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Not found' });
+    const byId = new Map(db.getProjects({ includeIgnored: true }).map(p => [p.id, p]));
+    res.json({
+      checkedAt: project.links_checked_at || null,
+      outdated: !!(project.links_checked_at && project.commit_hash && project.commit_hash !== project.links_commit_hash),
+      links: linksFor(project.id, db.getLinksTouching(project.id), byId),
+    });
+  });
+
+  // Doc drafts — generated into a temp dir, never into the project. The UI
+  // discards them when the dialog closes; copying one into the repo is manual.
+  app.post('/api/projects/:id/generate-docs', async (req, res) => {
+    const project = db.getProject(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Not found' });
+    const files = Array.isArray(req.body.files) ? req.body.files : [];
+    const unknown = files.filter(f => !docgen.KINDS[f]);
+    if (files.length === 0 || unknown.length > 0) {
+      return res.status(400).json({ error: `Ask for one or both of: ${Object.keys(docgen.KINDS).join(', ')}.` });
+    }
+    try {
+      res.json(await docgen.generateDocs(project, files));
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/projects/:id/drafts', (req, res) => {
+    res.json({ files: docgen.listDrafts(req.params.id) });
+  });
+
+  app.get('/api/projects/:id/drafts/:name', (req, res) => {
+    const content = docgen.readDraft(req.params.id, req.params.name);
+    if (content === null) return res.status(404).json({ error: 'No such draft' });
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${req.params.name}"`);
+    res.send(content);
+  });
+
+  app.delete('/api/projects/:id/drafts', (req, res) => {
+    docgen.discardDrafts(req.params.id);
+    res.json({ ok: true });
+  });
+
   // Scan
   app.post('/api/scan', (req, res) => {
     if (isScanInProgress()) {
       return res.status(409).json({ error: 'Scan already in progress' });
     }
-    const { projectIds, type = 'quick', forceRegenerate = false } = req.body;
+    // findLinks defaults off here so a bare API call never spends on it; the UI
+    // sends it ticked by default.
+    const { projectIds, type = 'quick', forceRegenerate = false, findLinks = false } = req.body;
 
     if (type === 'deep') {
       if (!projectIds || projectIds.length === 0) {
@@ -76,7 +126,7 @@ function createApp() {
 
     const label = type === 'deep' ? `deep scan (${projectIds.length} projects)` : (projectIds ? `quick scan (${projectIds.length} projects)` : 'quick scan (full fleet)');
     res.json({ ok: true, message: `${label} started` });
-    runScan(config.load(), type, { projectIds, forceRegenerate }).catch(console.error);
+    runScan(config.load(), type, { projectIds, forceRegenerate, findLinks: type === 'deep' && !!findLinks }).catch(console.error);
   });
 
   // Everything the Quick Scan confirmation needs to answer "do I even need to
@@ -88,6 +138,7 @@ function createApp() {
       scanRoots: cfg.scanRoots,
       ignore: cfg.ignore,
       projectsTracked: db.countProjects(),
+      ignoredCount: db.countIgnoredProjects(),
       lastFleetQuickScan: db.getLastFleetQuickScan() || null,
       lastAnyScan: db.getRecentScanRun() || null,
       avgDurationMs: db.getAverageQuickScanDuration(),
@@ -95,7 +146,7 @@ function createApp() {
   });
 
   app.get('/api/scan/cost-estimate', (_req, res) => {
-    res.json({ avgCostPerSummary: db.getAverageSummaryCost() });
+    res.json({ avgCostPerSummary: db.getAverageSummaryCost(), avgCostPerLinkScan: db.getAverageLinkCost() });
   });
 
   app.get('/api/scan/status', (_req, res) => {
@@ -128,7 +179,7 @@ function createApp() {
     res.setHeader('Connection', 'keep-alive');
 
     try {
-      for await (const event of globalChat(projects, message)) {
+      for await (const event of globalChat(projects, message, db.getAllLinks())) {
         res.write(`data: ${JSON.stringify(event)}\n\n`);
       }
     } catch (err) {
@@ -196,7 +247,7 @@ function createApp() {
 
   // Config (read-only — all config lives in .env)
   app.get('/api/config', (_req, res) => {
-    res.json(config.load());
+    res.json({ ...config.load(), model: MODEL });
   });
 
   return app;

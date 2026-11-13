@@ -42,7 +42,7 @@ Edit `.env` with your settings:
 ```
 ANTHROPIC_API_KEY=sk-ant-...
 SCAN_ROOTS=~/projects:Projects,~/dev:Dev
-CLAUDE_MODEL=claude-haiku-4-5
+CLAUDE_MODEL=claude-haiku-5-5
 ```
 
 Run it:
@@ -98,7 +98,15 @@ There are two chat modes. The **global chat** ("Ask AI" in the header) answers p
 - **search_files** -- Grep for patterns across the project
 - **git_command** -- Run read-only git commands (log, diff, blame, branch, etc.)
 
-No write operations are allowed. File access is sandboxed to the project directory.
+No write operations are allowed — there is no write tool. File access is sandboxed to the project directory.
+
+### Finding links between projects
+
+Deep Scan has a **Find links to other projects** checkbox, ticked by default. For each selected project, Claude reads its code and reports what it calls and serves: hostnames, API routes, domains, cloud resource IDs. A local search, with no AI call, then finds those identifiers in every tracked project. Results appear under **Links to other projects** in each project, and Ask AI uses them. It costs more per project than a summary; the Deep Scan dialog shows the estimate. Requires [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`).
+
+### Generating docs
+
+A project's detail view has a **Generate Docs** action that drafts a `CLAUDE.md` or `README.md` from the code. It runs the same read-only tools as the chat, as a one-shot with no chat session involved, and writes the result to a temp folder — never into the project. You download the draft or open the folder; copying it into the repo is a manual step. Drafts are deleted when the dialog closes. It reads far more of the codebase than a Deep Scan summary does, so expect a few cents per document.
 
 Chat sessions persist per project. **Condense** compresses the conversation history using AI (aggressive compression for old turns, light compression for recent ones) to save context. **Clear** wipes the session entirely.
 
@@ -110,13 +118,13 @@ All configuration lives in `.env`. Copy `.env.example` to get started.
 |----------|-------------|---------|
 | `ANTHROPIC_API_KEY` | Claude API key (required) | -- |
 | `SCAN_ROOTS` | Comma-separated `path:label` pairs | -- |
-| `CLAUDE_MODEL` | Model alias for all AI calls | `claude-haiku-4-5` |
+| `CLAUDE_MODEL` | Model for all AI calls. Claude 5.x only — see the price table in `src/models.js` | `claude-haiku-5-5` |
 | `HOST` | Server bind address | `127.0.0.1` |
 | `PORT` | Server port | `7777` |
 | `ACTIVE_CUTOFF_DAYS` | How far back to look for "active" projects | `30` |
 | `MAX_SUMMARIES_PER_SCAN` | Max projects in a single Deep Scan selection | `50` |
 | `IGNORE_PATHS` | Comma-separated directory paths to skip | -- |
-| `PRICE_INPUT_MTOK` / `PRICE_OUTPUT_MTOK` | Per-million-token pricing for `CLAUDE_MODEL`, used to compute the in-app cost meter | `0.80` / `4.00` (Haiku) |
+| `PRICE_INPUT_MTOK` / `PRICE_OUTPUT_MTOK` | Override the per-million-token pricing used by the in-app cost meter | from the price table in `src/models.js`, keyed by `CLAUDE_MODEL` |
 
 ### Cost
 
